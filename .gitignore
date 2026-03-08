@@ -1,0 +1,22 @@
+whisper/source/
+whisper/processed/
+whisper/transcripts/
+scripts/downloads/
+scripts/www.youtube.com_cookies.txt
+env/
+
+# Python virtual environments
+env/
+venv/
+.venv/
+ENV/
+
+# dotenv
+.env
+
+# python cache
+__pycache__/
+*.pyc
+
+# OS
+.DS_Store
