@@ -13,7 +13,6 @@ load_dotenv()
 SOURCE = "source"
 PROCESSED = "processed"
 TRANSCRIPTS = "transcripts"
-#WEBHOOK_URL = "https://n8n.evida.ar/webhook/whisper-transcript"
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 MODEL_SIZE = "small"
 
