@@ -20,8 +20,8 @@
 #   python ythelper.py --mode download-all   --ids abc123
 #   python ythelper.py --mode transcribe
 #   python ythelper.py --mode webhook
-#   python ythelper.py --mode run-audio --ids abc123
-#   python ythelper.py --mode run-full  --ids-file ids.txt
+#   python ythelper.py --mode run-full --ids abc123
+#   python ythelper.py --mode run-audio  --ids-file ids.txt            <--- 
 #
 # Modo resume (reintenta los IDs que fallaron o quedaron pendientes):
 #

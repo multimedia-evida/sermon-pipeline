@@ -1,5 +1,6 @@
 # Variables de entorno — nunca commitear credenciales
 .env
+!.env.example.txt
 
 # Datos generados en tiempo de ejecución
 data/
