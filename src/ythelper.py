@@ -9,8 +9,8 @@
 #   download-all    → Descarga audio WAV + video en una sola pasada
 #   transcribe      → Transcribe los .wav/.mp3 que haya en source/
 #   webhook         → Envía los .json de transcripts/ al webhook (lotes de 3)
-#   run-audio       → Pipeline: download-audio → transcribe → webhook
-#   run-full        → Pipeline: download-all → transcribe → webhook
+#   run-audio       → Pipeline intercalado por video: descarga → transcribe → webhook
+#   run-full        → Pipeline intercalado por video: descarga audio+video → transcribe → webhook
 #
 # Ejemplos:
 #
@@ -48,12 +48,20 @@
 #   YT_COOKIES_PATH  → Ruta al archivo de cookies de YouTube
 #
 # Estructura de carpetas:
-#   source/      → Audios WAV listos para transcribir
-#   videos/      → Videos descargados (máxima calidad)
-#   processed/   → Audios ya transcriptos (movidos desde source/)
-#   transcripts/      → JSONs pendientes de enviar al webhook
-#   transcripts/done/ → JSONs enviados exitosamente (webhook 200)
-#   logs/        → Logs por ejecución (fecha.log) + progress.json
+#   data/input/source/           → Audios WAV listos para transcribir
+#   data/input/videos/           → Videos descargados (máxima calidad)
+#   data/output/processed/       → Audios ya transcriptos (movidos desde source/)
+#   data/output/transcripts/     → JSONs pendientes de enviar al webhook
+#   data/output/transcripts/done/→ JSONs enviados exitosamente (webhook 200)
+#   data/logs/                   → Logs por ejecución (fecha.log) + progress.json
+#
+# Comportamiento de auto-retry en run-audio / run-full:
+#   - El pipeline procesa cada video de forma intercalada:
+#     descarga → transcribe → webhook → siguiente video
+#   - La transcripción actúa como cooldown natural entre descargas de YT
+#   - Al finalizar el loop principal, si quedan IDs con FAILED en
+#     step download-audio o download-video, se ejecutan hasta 2 rondas
+#     de reintento con 5 minutos de pausa entre cada intento individual
 #
 # ==========================
 
@@ -75,20 +83,22 @@ load_dotenv()
 # CONFIGURACIÓN
 # ==========================
 
-SOURCE      = "source"
-VIDEOS      = "videos"
-PROCESSED   = "processed"
-TRANSCRIPTS      = "transcripts"
-TRANSCRIPTS_DONE = "transcripts/done"
-LOGS_DIR         = "logs"
-PROGRESS_FILE = os.path.join(LOGS_DIR, "progress.json")
+SOURCE           = "data/input/source"
+VIDEOS           = "data/input/videos"
+PROCESSED        = "data/output/processed"
+TRANSCRIPTS      = "data/output/transcripts"
+TRANSCRIPTS_DONE = "data/output/transcripts/done"
+LOGS_DIR         = "data/logs"
+PROGRESS_FILE    = os.path.join(LOGS_DIR, "progress.json")
 
 WEBHOOK_URL    = os.getenv("WEBHOOK_URL")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 COOKIES_PATH   = os.getenv("YT_COOKIES_PATH")
-MODEL_SIZE   = "small"
+MODEL_SIZE     = "small"
 
-FILENAME_TEMPLATE = "%(upload_date)s_%(id)s_%(title)s.%(ext)s"
+FILENAME_TEMPLATE  = "%(upload_date)s_%(id)s_%(title)s.%(ext)s"
+RETRY_MAX_ATTEMPTS = 2
+RETRY_WAIT_SECONDS = 300  # 5 minutos
 
 
 # ==========================
@@ -100,7 +110,7 @@ def setup_logging():
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_file  = os.path.join(LOGS_DIR, f"{timestamp}.log")
 
-    fmt = "[%(asctime)s] %(levelname)-5s %(message)s"
+    fmt     = "[%(asctime)s] %(levelname)-5s %(message)s"
     datefmt = "%Y-%m-%d %H:%M:%S"
 
     logging.basicConfig(
@@ -198,16 +208,24 @@ def yt_url(video_id):
     return f"https://www.youtube.com/watch?v={video_id}"
 
 
+def find_downloaded_audio(video_id):
+    """Busca en source/ el archivo WAV que corresponde a un video_id."""
+    for f in os.listdir(SOURCE):
+        if video_id in f and f.lower().endswith(".wav"):
+            return f
+    return None
+
+
 def print_summary(progress):
-    done    = sum(1 for d in progress.values() if d.get("status") == "DONE")
-    failed  = sum(1 for d in progress.values() if d.get("status") == "FAILED")
-    total   = len(progress)
-    log.info(f"")
+    done   = sum(1 for d in progress.values() if d.get("status") == "DONE")
+    failed = sum(1 for d in progress.values() if d.get("status") == "FAILED")
+    total  = len(progress)
+    log.info("")
     log.info(f"{'='*45}")
     log.info(f"  RESUMEN FINAL")
-    log.info(f"  Total  : {total}")
-    log.info(f"  ✅ OK   : {done}")
-    log.info(f"  ❌ Falló: {failed}")
+    log.info(f"  Total   : {total}")
+    log.info(f"  ✅ OK    : {done}")
+    log.info(f"  ❌ Falló : {failed}")
     log.info(f"{'='*45}")
     if failed:
         failed_ids = [vid for vid, d in progress.items() if d.get("status") == "FAILED"]
@@ -266,6 +284,7 @@ def download_video_for_id(video_id):
 
 
 def download_audio(ids, progress):
+    """Descarga solo audio para una lista de IDs (modo standalone)."""
     os.makedirs(SOURCE, exist_ok=True)
     check_cookies()
     total = len(ids)
@@ -274,7 +293,6 @@ def download_audio(ids, progress):
     for i, video_id in enumerate(ids, 1):
         log.info(f"⬇ [{i}/{total}] Audio → {video_id}")
         update_progress(progress, video_id, "IN_PROGRESS", step="download-audio")
-
         ok = download_audio_for_id(video_id)
         if ok:
             log.info(f"✅ [{i}/{total}] Audio OK → {video_id}")
@@ -285,6 +303,7 @@ def download_audio(ids, progress):
 
 
 def download_video(ids, progress):
+    """Descarga solo video para una lista de IDs (modo standalone)."""
     os.makedirs(VIDEOS, exist_ok=True)
     check_cookies()
     total = len(ids)
@@ -293,7 +312,6 @@ def download_video(ids, progress):
     for i, video_id in enumerate(ids, 1):
         log.info(f"⬇ [{i}/{total}] Video → {video_id}")
         update_progress(progress, video_id, "IN_PROGRESS", step="download-video")
-
         ok = download_video_for_id(video_id)
         if ok:
             log.info(f"✅ [{i}/{total}] Video OK → {video_id}")
@@ -304,6 +322,7 @@ def download_video(ids, progress):
 
 
 def download_audio_and_video(ids, progress):
+    """Descarga audio + video para una lista de IDs (modo standalone)."""
     os.makedirs(SOURCE, exist_ok=True)
     os.makedirs(VIDEOS, exist_ok=True)
     check_cookies()
@@ -327,7 +346,6 @@ def download_audio_and_video(ids, progress):
 
         if ok_audio:
             log.info(f"✅ [{i}/{total}] Audio OK → {video_id}")
-            # Solo marca DONE si ambos tuvieron éxito
             if ok_video:
                 update_progress(progress, video_id, "DONE", step="download-all")
             else:
@@ -335,6 +353,99 @@ def download_audio_and_video(ids, progress):
         else:
             log.error(f"❌ [{i}/{total}] Audio FAILED → {video_id}")
             update_progress(progress, video_id, "FAILED", step="download-audio", error="yt-dlp error")
+
+
+# ==========================
+# AUTO-RETRY DESCARGAS
+# ==========================
+
+DOWNLOAD_FAIL_STEPS = ("download-audio", "download-video", "download-all")
+
+
+def get_failed_downloads(progress, ids):
+    """Retorna los IDs del batch actual que fallaron en algún paso de descarga."""
+    return [
+        vid for vid in ids
+        if progress.get(vid, {}).get("status") == "FAILED"
+        and progress.get(vid, {}).get("step") in DOWNLOAD_FAIL_STEPS
+    ]
+
+
+def auto_retry_downloads(ids, progress, include_video=False):
+    """
+    Reintenta la descarga de audio (y video si include_video=True)
+    para los IDs fallidos del batch.
+    Máximo RETRY_MAX_ATTEMPTS rondas con RETRY_WAIT_SECONDS de pausa
+    entre cada intento individual dentro de una ronda.
+    """
+    failed = get_failed_downloads(progress, ids)
+
+    if not failed:
+        return
+
+    log.info("")
+    log.info(f"🔄 Auto-retry: {len(failed)} IDs fallidos en descarga")
+
+    for attempt in range(1, RETRY_MAX_ATTEMPTS + 1):
+        if not failed:
+            break
+
+        log.info(f"{'='*45}")
+        log.info(f"  AUTO-RETRY ronda {attempt}/{RETRY_MAX_ATTEMPTS} | {len(failed)} ID(s)")
+        log.info(f"{'='*45}")
+
+        still_failed = []
+
+        for i, video_id in enumerate(failed, 1):
+            # Pausa antes de cada intento (excepto el primero de la ronda)
+            if i > 1:
+                log.info(f"⏳ Esperando {RETRY_WAIT_SECONDS // 60} min antes del siguiente reintento...")
+                time.sleep(RETRY_WAIT_SECONDS)
+
+            log.info(f"🔄 [{i}/{len(failed)}] Reintentando → {video_id} (ronda {attempt})")
+
+            ok_video = True  # asumir OK si no se necesita video
+            ok_audio = False
+
+            if include_video:
+                update_progress(progress, video_id, "IN_PROGRESS", step="download-video")
+                ok_video = download_video_for_id(video_id)
+                if ok_video:
+                    log.info(f"✅ Video OK → {video_id}")
+                else:
+                    log.error(f"❌ Video FAILED → {video_id}")
+                    update_progress(progress, video_id, "FAILED", step="download-video",
+                                    error=f"retry {attempt} failed")
+
+            update_progress(progress, video_id, "IN_PROGRESS", step="download-audio")
+            ok_audio = download_audio_for_id(video_id)
+
+            if ok_audio and ok_video:
+                log.info(f"✅ Reintento exitoso → {video_id}")
+                update_progress(progress, video_id, "DONE", step="download-audio")
+
+                # Continuar con transcripción y webhook para este ID recuperado
+                audio_file = find_downloaded_audio(video_id)
+                if audio_file:
+                    from faster_whisper import WhisperModel
+                    log.info(f"🚀 Cargando modelo Whisper para reintento...")
+                    model = WhisperModel(MODEL_SIZE, compute_type="int8", cpu_threads=4)
+                    json_path = process_whisper_file(audio_file, model, progress, i, len(failed))
+                    if json_path:
+                        send_webhook(json_path, progress)
+            else:
+                log.error(f"❌ Reintento fallido → {video_id} (ronda {attempt})")
+                failed_step = "download-audio" if not ok_audio else "download-video"
+                update_progress(progress, video_id, "FAILED", step=failed_step,
+                                error=f"retry {attempt} failed")
+                still_failed.append(video_id)
+
+        failed = still_failed
+
+    if failed:
+        log.error(f"❌ {len(failed)} ID(s) siguen fallando tras {RETRY_MAX_ATTEMPTS} reintentos: {failed}")
+    else:
+        log.info(f"✅ Auto-retry completado. Todos los reintentos exitosos.")
 
 
 # ==========================
@@ -402,6 +513,7 @@ def load_whisper_model():
 
 
 def run_transcribe(progress):
+    """Transcribe todos los archivos en source/ (modo standalone)."""
     model = load_whisper_model()
     files = sorted([f for f in os.listdir(SOURCE) if f.lower().endswith(('.wav', '.mp3'))])
     total = len(files)
@@ -411,7 +523,7 @@ def run_transcribe(progress):
         json_path = process_whisper_file(f, model, progress, i, total)
         if json_path:
             json_paths.append(json_path)
-    return model, files, json_paths
+    return json_paths
 
 
 # ==========================
@@ -442,6 +554,7 @@ def send_webhook(json_path, progress):
 
 
 def run_webhook(progress):
+    """Envía todos los JSONs en transcripts/ al webhook (modo standalone)."""
     files = sorted([f for f in os.listdir(TRANSCRIPTS) if f.endswith('.json')])
     total = len(files)
     log.info(f"🚀 Modo Webhook | {total} archivos")
@@ -458,11 +571,95 @@ def run_webhook(progress):
 
 
 # ==========================
+# PIPELINE INTERCALADO
+# ==========================
+
+def run_pipeline(ids, progress, include_video=False):
+    """
+    Pipeline intercalado por video:
+      Para cada ID: descarga → transcribe → webhook → siguiente ID
+
+    La transcripción actúa como cooldown natural entre descargas de YT.
+    Al finalizar, ejecuta auto-retry para los IDs que fallaron en descarga.
+    """
+    check_cookies()
+    total = len(ids)
+    model = load_whisper_model()
+
+    for i, video_id in enumerate(ids, 1):
+        log.info("")
+        log.info(f"{'─'*45}")
+        log.info(f"  [{i}/{total}] Procesando → {video_id}")
+        log.info(f"{'─'*45}")
+
+        # ── 1. DESCARGA ───────────────────────────────────────
+        if include_video:
+            log.info(f"⬇ [{i}/{total}] Video → {video_id}")
+            update_progress(progress, video_id, "IN_PROGRESS", step="download-video")
+            ok_video = download_video_for_id(video_id)
+            if ok_video:
+                log.info(f"✅ [{i}/{total}] Video OK → {video_id}")
+            else:
+                log.error(f"❌ [{i}/{total}] Video FAILED → {video_id}")
+                update_progress(progress, video_id, "FAILED", step="download-video", error="yt-dlp error")
+
+        log.info(f"⬇ [{i}/{total}] Audio → {video_id}")
+        update_progress(progress, video_id, "IN_PROGRESS", step="download-audio")
+        ok_audio = download_audio_for_id(video_id)
+
+        if not ok_audio:
+            log.error(f"❌ [{i}/{total}] Audio FAILED → {video_id} | saltando transcripción y webhook")
+            update_progress(progress, video_id, "FAILED", step="download-audio", error="yt-dlp error")
+            continue  # sigue con el siguiente ID
+
+        log.info(f"✅ [{i}/{total}] Audio OK → {video_id}")
+
+        # ── 2. TRANSCRIPCIÓN ──────────────────────────────────
+        audio_file = find_downloaded_audio(video_id)
+        if not audio_file:
+            log.error(f"❌ [{i}/{total}] No se encontró el WAV en source/ → {video_id}")
+            update_progress(progress, video_id, "FAILED", step="transcribe", error="wav not found in source/")
+            continue
+
+        json_path = process_whisper_file(audio_file, model, progress, i, total)
+
+        if not json_path:
+            log.error(f"❌ [{i}/{total}] Transcripción falló → {video_id} | saltando webhook")
+            continue
+
+        # ── 3. WEBHOOK ────────────────────────────────────────
+        send_webhook(json_path, progress)
+
+    # ── AUTO-RETRY para descargas fallidas ────────────────────
+    auto_retry_downloads(ids, progress, include_video=include_video)
+
+
+# ==========================
 # MAIN
 # ==========================
 
 def main():
-    parser = argparse.ArgumentParser(description="ythelper: YouTube → Whisper → Webhook")
+    parser = argparse.ArgumentParser(
+        description="ythelper: YouTube → Whisper → Webhook",
+        formatter_class=argparse.RawTextHelpFormatter,
+        epilog="""
+modos:
+  download-audio   Descarga solo audio WAV → source/
+  download-video   Descarga solo video (máx calidad) → videos/
+  download-all     Descarga audio + video en una pasada
+  transcribe       Transcribe los archivos en source/
+  webhook          Envía transcripts al webhook (lotes de 3)
+  run-audio        Pipeline intercalado: audio → transcribe → webhook
+  run-full         Pipeline intercalado: audio+video → transcribe → webhook
+
+ejemplos:
+  python ythelper.py --mode run-full  --ids abc123 def456
+  python ythelper.py --mode run-audio --ids-file ids.txt
+  python ythelper.py --mode run-full  --resume
+  python ythelper.py --mode transcribe
+  python ythelper.py --mode webhook
+        """
+    )
     parser.add_argument(
         "--mode",
         choices=[
@@ -475,10 +672,11 @@ def main():
             "run-full",
         ],
         required=True,
-        help="Modo de ejecución"
+        metavar="MODE",
+        help="Modo de ejecución (ver lista abajo)"
     )
-    parser.add_argument("--ids",      nargs="+", help="IDs de YouTube")
-    parser.add_argument("--ids-file", help="Archivo .txt con IDs de YouTube")
+    parser.add_argument("--ids",      nargs="+", help="IDs de YouTube separados por espacio")
+    parser.add_argument("--ids-file", help="Archivo .txt con IDs (uno por línea o varios por línea)")
     parser.add_argument(
         "--resume",
         action="store_true",
@@ -496,10 +694,8 @@ def main():
     log.info(f"  ythelper | modo: {args.mode} | resume: {args.resume}")
     log.info(f"{'='*45}")
 
-    # Cargar o inicializar progress
     progress = load_progress()
 
-    # Resolver IDs según --resume o argumentos
     needs_ids = args.mode in ("download-audio", "download-video", "download-all", "run-audio", "run-full")
 
     if needs_ids:
@@ -507,12 +703,10 @@ def main():
             ids, progress = load_ids_for_resume()
         else:
             ids = load_ids(args)
-            # Registrar todos los IDs como PENDING al inicio
             for vid in ids:
                 if vid not in progress:
                     update_progress(progress, vid, "PENDING")
-        total_ids = len(ids)
-        log.info(f"📋 IDs a procesar: {total_ids}")
+        log.info(f"📋 IDs a procesar: {len(ids)}")
 
     # ── DOWNLOAD-AUDIO ────────────────────────────────────────
     if args.mode == "download-audio":
@@ -536,33 +730,11 @@ def main():
 
     # ── RUN-AUDIO ─────────────────────────────────────────────
     elif args.mode == "run-audio":
-        log.info("▶ Paso 1/3: Descarga de audio")
-        download_audio(ids, progress)
-
-        log.info("▶ Paso 2/3: Transcripción")
-        model = load_whisper_model()
-        files = sorted([f for f in os.listdir(SOURCE) if f.lower().endswith(('.wav', '.mp3'))])
-        total = len(files)
-        for i, f in enumerate(files, 1):
-            json_path = process_whisper_file(f, model, progress, i, total)
-            if json_path:
-                log.info("▶ Paso 3/3: Webhook")
-                send_webhook(json_path, progress)
+        run_pipeline(ids, progress, include_video=False)
 
     # ── RUN-FULL ──────────────────────────────────────────────
     elif args.mode == "run-full":
-        log.info("▶ Paso 1/3: Descarga de audio + video")
-        download_audio_and_video(ids, progress)
-
-        log.info("▶ Paso 2/3: Transcripción")
-        model = load_whisper_model()
-        files = sorted([f for f in os.listdir(SOURCE) if f.lower().endswith(('.wav', '.mp3'))])
-        total = len(files)
-        for i, f in enumerate(files, 1):
-            json_path = process_whisper_file(f, model, progress, i, total)
-            if json_path:
-                log.info("▶ Paso 3/3: Webhook")
-                send_webhook(json_path, progress)
+        run_pipeline(ids, progress, include_video=True)
 
     print_summary(progress)
     log.info("✨ ¡Todo terminado!")

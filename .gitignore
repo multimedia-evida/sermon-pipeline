@@ -1,22 +1,18 @@
-whisper/source/
-whisper/processed/
-whisper/transcripts/
-scripts/downloads/
-scripts/www.youtube.com_cookies.txt
-env/
-
-# Python virtual environments
-env/
-venv/
-.venv/
-ENV/
-
-# dotenv
+# Variables de entorno — nunca commitear credenciales
 .env
 
-# python cache
-__pycache__/
-*.pyc
+# Datos generados en tiempo de ejecución
+data/
 
-# OS
-.DS_Store
+# Cookies de YouTube — nunca commitear
+*.txt
+!ids.txt
+!requirements.txt
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/

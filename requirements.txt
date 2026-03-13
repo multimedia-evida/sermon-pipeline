@@ -1,0 +1,8 @@
+# Transcripción de audio con Whisper (modelo local, sin API externa)
+faster-whisper
+
+# Llamadas HTTP al webhook
+requests
+
+# Lectura del archivo .env
+python-dotenv
