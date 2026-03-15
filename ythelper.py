@@ -11,6 +11,8 @@
 #   webhook         → Envía los .json de transcripts/ al webhook (lotes de 3)
 #   run-audio       → Pipeline intercalado por video: descarga → transcribe → webhook
 #   run-full        → Pipeline intercalado por video: descarga audio+video → transcribe → webhook
+#   local           → Pipeline desde archivo local (NAS): transcribe → webhook
+#                     El video original se mueve a processed/ dentro del NAS al terminar
 #
 # Ejemplos:
 #
@@ -20,8 +22,10 @@
 #   python ythelper.py --mode download-all   --ids abc123
 #   python ythelper.py --mode transcribe
 #   python ythelper.py --mode webhook
-#   python ythelper.py --mode run-full --ids abc123
-#   python ythelper.py --mode run-audio  --ids-file ids.txt            <--- 
+#   python ythelper.py --mode run-audio --ids abc123
+#   python ythelper.py --mode run-full  --ids-file ids.txt
+#   python ythelper.py --mode local --file /mnt/nas/sermones/video.mp4
+#   python ythelper.py --mode local --local-folder /mnt/nas/sermones/
 #
 # Modo resume (reintenta los IDs que fallaron o quedaron pendientes):
 #
@@ -635,6 +639,156 @@ def run_pipeline(ids, progress, include_video=False):
 
 
 # ==========================
+# PIPELINE LOCAL (NAS)
+# ==========================
+
+LOCAL_VIDEO_EXTENSIONS = ('.mp4', '.mkv')
+
+
+def load_local_files(args):
+    """Recolecta archivos de video desde --file y/o --local-folder."""
+    files = []
+
+    if args.file:
+        for f in args.file:
+            if not os.path.exists(f):
+                log.error(f"❌ Archivo no encontrado: {f}")
+            elif not f.lower().endswith(LOCAL_VIDEO_EXTENSIONS):
+                log.error(f"❌ Formato no soportado (solo mp4/mkv): {f}")
+            else:
+                files.append(os.path.abspath(f))
+
+    if args.local_folder:
+        folder = args.local_folder
+        if not os.path.isdir(folder):
+            log.error(f"❌ Carpeta no encontrada: {folder}")
+        else:
+            found = sorted([
+                os.path.abspath(os.path.join(folder, f))
+                for f in os.listdir(folder)
+                if f.lower().endswith(LOCAL_VIDEO_EXTENSIONS)
+            ])
+            log.info(f"📂 Carpeta NAS: {len(found)} archivo(s) encontrados en {folder}")
+            files.extend(found)
+
+    if not files:
+        log.error("❌ No se encontraron archivos válidos. Usá --file o --local-folder.")
+        sys.exit(1)
+
+    # Eliminar duplicados manteniendo orden
+    seen = set()
+    unique = []
+    for f in files:
+        if f not in seen:
+            seen.add(f)
+            unique.append(f)
+
+    return unique
+
+
+def process_local_file(filepath, model, progress, index, total):
+    """
+    Transcribe un archivo de video local (mp4/mkv) directamente desde el NAS.
+    - Usa el nombre del archivo como key en progress.json
+    - Mueve el archivo original a processed/ dentro de su carpeta de origen
+    """
+    filename  = os.path.basename(filepath)
+    base_name = os.path.splitext(filename)[0]
+    json_path = os.path.join(TRANSCRIPTS, f"{base_name}.json")
+    file_key  = filename  # key en progress.json es el nombre del archivo
+
+    log.info(f"🎧 [{index}/{total}] Transcribiendo (local) → {filename}")
+    update_progress(progress, file_key, "IN_PROGRESS", step="transcribe")
+
+    try:
+        segments, info = model.transcribe(filepath, language="es")
+
+        result = {
+            "filename": filename,
+            "language": info.language,
+            "duration": info.duration,
+            "segments": []
+        }
+
+        for segment in segments:
+            percent = (segment.end / info.duration) * 100
+            sys.stdout.write(f"\r   ⏳ Progreso: {percent:.2f}% | {segment.end:.1f}/{info.duration:.1f} seg")
+            sys.stdout.flush()
+
+            result["segments"].append({
+                "start": segment.start,
+                "end":   segment.end,
+                "text":  segment.text.strip()
+            })
+
+        print()
+        log.info(f"   💾 Guardando transcripción → {json_path}")
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(result, f, indent=4, ensure_ascii=False)
+
+        # Mover video original a processed/ dentro de su carpeta en el NAS
+        nas_processed_dir = os.path.join(os.path.dirname(filepath), "processed")
+        os.makedirs(nas_processed_dir, exist_ok=True)
+        dest = os.path.join(nas_processed_dir, filename)
+        shutil.move(filepath, dest)
+        log.info(f"   📁 Video movido → {dest}")
+
+        update_progress(progress, file_key, "DONE", step="transcribe")
+        return json_path, file_key
+
+    except Exception as e:
+        log.error(f"❌ [{index}/{total}] Transcripción FAILED → {filename} | {e}")
+        update_progress(progress, file_key, "FAILED", step="transcribe", error=e)
+        return None, file_key
+
+
+def send_webhook_local(json_path, file_key, progress):
+    """Versión de send_webhook que usa file_key (nombre de archivo) en lugar de video_id."""
+    filename = os.path.basename(json_path)
+    log.info(f"🌐 Webhook → {filename}")
+    update_progress(progress, file_key, "IN_PROGRESS", step="webhook")
+    try:
+        with open(json_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        headers = {"X-Webhook-Secret": WEBHOOK_SECRET} if WEBHOOK_SECRET else {}
+        r = requests.post(WEBHOOK_URL, json=data, headers=headers, timeout=30)
+        if r.status_code == 200:
+            log.info(f"   ✅ Webhook OK → status {r.status_code}")
+            shutil.move(json_path, os.path.join(TRANSCRIPTS_DONE, filename))
+            log.info(f"   📁 Movido → transcripts/done/{filename}")
+            update_progress(progress, file_key, "DONE", step="webhook")
+        else:
+            log.error(f"   ❌ Webhook respondió {r.status_code} → {filename}")
+            update_progress(progress, file_key, "FAILED", step="webhook", error=f"status {r.status_code}")
+    except Exception as e:
+        log.error(f"   ❌ Webhook FAILED → {filename} | {e}")
+        update_progress(progress, file_key, "FAILED", step="webhook", error=e)
+
+
+def run_local_pipeline(files, progress):
+    """
+    Pipeline para archivos locales del NAS:
+      Para cada archivo: transcribe → webhook → siguiente
+    """
+    total = len(files)
+    model = load_whisper_model()
+
+    for i, filepath in enumerate(files, 1):
+        filename = os.path.basename(filepath)
+        log.info("")
+        log.info(f"{'─'*45}")
+        log.info(f"  [{i}/{total}] Procesando (local) → {filename}")
+        log.info(f"{'─'*45}")
+
+        json_path, file_key = process_local_file(filepath, model, progress, i, total)
+
+        if json_path:
+            send_webhook_local(json_path, file_key, progress)
+        else:
+            log.error(f"❌ [{i}/{total}] Saltando webhook → {filename}")
+
+
+# ==========================
 # MAIN
 # ==========================
 
@@ -651,6 +805,7 @@ modos:
   webhook          Envía transcripts al webhook (lotes de 3)
   run-audio        Pipeline intercalado: audio → transcribe → webhook
   run-full         Pipeline intercalado: audio+video → transcribe → webhook
+  local            Pipeline desde NAS: transcribe → webhook (sin descarga)
 
 ejemplos:
   python ythelper.py --mode run-full  --ids abc123 def456
@@ -658,6 +813,8 @@ ejemplos:
   python ythelper.py --mode run-full  --resume
   python ythelper.py --mode transcribe
   python ythelper.py --mode webhook
+  python ythelper.py --mode local --file /mnt/nas/sermones/video.mp4
+  python ythelper.py --mode local --local-folder /mnt/nas/sermones/
         """
     )
     parser.add_argument(
@@ -670,6 +827,7 @@ ejemplos:
             "webhook",
             "run-audio",
             "run-full",
+            "local",
         ],
         required=True,
         metavar="MODE",
@@ -677,6 +835,15 @@ ejemplos:
     )
     parser.add_argument("--ids",      nargs="+", help="IDs de YouTube separados por espacio")
     parser.add_argument("--ids-file", help="Archivo .txt con IDs (uno por línea o varios por línea)")
+    parser.add_argument(
+        "--file",
+        nargs="+",
+        help="Uno o más archivos de video locales (mp4/mkv) para modo local"
+    )
+    parser.add_argument(
+        "--local-folder",
+        help="Carpeta del NAS — procesa todos los mp4/mkv que encuentre (modo local)"
+    )
     parser.add_argument(
         "--resume",
         action="store_true",
@@ -693,6 +860,10 @@ ejemplos:
     log.info(f"{'='*45}")
     log.info(f"  ythelper | modo: {args.mode} | resume: {args.resume}")
     log.info(f"{'='*45}")
+
+    # Validación: local requiere --file o --local-folder
+    if args.mode == "local" and not args.file and not args.local_folder:
+        parser.error("--mode local requiere --file y/o --local-folder")
 
     progress = load_progress()
 
@@ -735,6 +906,15 @@ ejemplos:
     # ── RUN-FULL ──────────────────────────────────────────────
     elif args.mode == "run-full":
         run_pipeline(ids, progress, include_video=True)
+
+    # ── LOCAL ─────────────────────────────────────────────────
+    elif args.mode == "local":
+        files = load_local_files(args)
+        log.info(f"📋 Archivos a procesar: {len(files)}")
+        for f in files:
+            if os.path.basename(f) not in progress:
+                update_progress(progress, os.path.basename(f), "PENDING")
+        run_local_pipeline(files, progress)
 
     print_summary(progress)
     log.info("✨ ¡Todo terminado!")
