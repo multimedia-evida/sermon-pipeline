@@ -9,6 +9,7 @@
 #   download-all    → Descarga audio WAV + video en una sola pasada
 #   transcribe      → Transcribe los .wav/.mp3 que haya en source/
 #   webhook         → Envía los .json de transcripts/ al webhook (lotes de 3)
+#                     Con --file envía solo ese JSON específico (sin lotes ni cooldown)
 #   run-audio       → Pipeline intercalado por video: descarga → transcribe → webhook
 #   run-full        → Pipeline intercalado por video: descarga audio+video → transcribe → webhook
 #   local           → Pipeline desde archivo local (NAS): transcribe → webhook
@@ -22,6 +23,8 @@
 #   python ythelper.py --mode download-all   --ids abc123
 #   python ythelper.py --mode transcribe
 #   python ythelper.py --mode webhook
+#   python ythelper.py --mode webhook --file /ruta/al/transcript.json
+#   python ythelper.py --mode webhook --file t1.json t2.json
 #   python ythelper.py --mode run-audio --ids abc123
 #   python ythelper.py --mode run-full  --ids-file ids.txt
 #   python ythelper.py --mode local --file /mnt/nas/sermones/video.mp4
@@ -557,8 +560,29 @@ def send_webhook(json_path, progress):
         update_progress(progress, video_id, "FAILED", step="webhook", error=e)
 
 
-def run_webhook(progress):
-    """Envía todos los JSONs en transcripts/ al webhook (modo standalone)."""
+def run_webhook(progress, files_override=None):
+    """
+    Envía JSONs al webhook.
+    - Sin --file: procesa todos los JSONs en transcripts/ (lotes de 3 con cooldown)
+    - Con --file: envía solo los archivos especificados, sin cooldown ni lotes
+    """
+    if files_override:
+        total = len(files_override)
+        log.info(f"🚀 Modo Webhook (archivos específicos) | {total} archivo(s)")
+        for json_path in files_override:
+            if not os.path.exists(json_path):
+                log.error(f"❌ Archivo no encontrado: {json_path}")
+                continue
+            if not json_path.endswith('.json'):
+                log.error(f"❌ No es un archivo JSON: {json_path}")
+                continue
+            # Usa el nombre del archivo como key en progress
+            file_key = os.path.basename(json_path)
+            update_progress(progress, file_key, "PENDING")
+            send_webhook_local(json_path, file_key, progress)
+        return
+
+    # Comportamiento original: todos los JSONs en transcripts/
     files = sorted([f for f in os.listdir(TRANSCRIPTS) if f.endswith('.json')])
     total = len(files)
     log.info(f"🚀 Modo Webhook | {total} archivos")
@@ -897,7 +921,10 @@ ejemplos:
 
     # ── WEBHOOK ───────────────────────────────────────────────
     elif args.mode == "webhook":
-        run_webhook(progress)
+        if args.file:
+            run_webhook(progress, files_override=args.file)
+        else:
+            run_webhook(progress)
 
     # ── RUN-AUDIO ─────────────────────────────────────────────
     elif args.mode == "run-audio":
