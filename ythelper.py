@@ -720,14 +720,16 @@ def process_local_file(filepath, model, progress, index, total):
     base_name = os.path.splitext(filename)[0]
     json_path = os.path.join(TRANSCRIPTS, f"{base_name}.json")
     file_key  = filename  # key en progress.json es el nombre del archivo
+    video_id  = get_clean_video_id(filename)  # extrae ID del nombre igual que en modo online
 
-    log.info(f"🎧 [{index}/{total}] Transcribiendo (local) → {filename}")
+    log.info(f"🎧 [{index}/{total}] Transcribiendo (local) → {filename} (ID: {video_id})")
     update_progress(progress, file_key, "IN_PROGRESS", step="transcribe")
 
     try:
         segments, info = model.transcribe(filepath, language="es")
 
         result = {
+            "videoId":  video_id,
             "filename": filename,
             "language": info.language,
             "duration": info.duration,
