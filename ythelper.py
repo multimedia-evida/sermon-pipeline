@@ -50,7 +50,8 @@
 #       1kwue3QCOyo
 #
 # Variables de entorno requeridas en .env:
-#   WEBHOOK_URL      → URL del webhook destino
+#   WEBHOOK_URL      → URL del webhook destino (producción)
+#   WEBHOOK_URL_TEST → URL del webhook destino (pruebas, usar con --test)
 #   WEBHOOK_SECRET   → Header de autenticación (X-Webhook-Secret)
 #   YT_COOKIES_PATH  → Ruta al archivo de cookies de YouTube
 #
@@ -98,10 +99,14 @@ TRANSCRIPTS_DONE = "data/output/transcripts/done"
 LOGS_DIR         = "data/logs"
 PROGRESS_FILE    = os.path.join(LOGS_DIR, "progress.json")
 
-WEBHOOK_URL    = os.getenv("WEBHOOK_URL")
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
-COOKIES_PATH   = os.getenv("YT_COOKIES_PATH")
-MODEL_SIZE     = "small"
+WEBHOOK_URL      = os.getenv("WEBHOOK_URL")
+WEBHOOK_URL_TEST = os.getenv("WEBHOOK_URL_TEST")
+WEBHOOK_SECRET   = os.getenv("WEBHOOK_SECRET")
+COOKIES_PATH     = os.getenv("YT_COOKIES_PATH")
+MODEL_SIZE       = "small"
+
+# Se sobreescribe en main() según --test
+ACTIVE_WEBHOOK_URL = None
 
 FILENAME_TEMPLATE  = "%(upload_date)s_%(id)s_%(title)s.%(ext)s"
 RETRY_MAX_ATTEMPTS = 2
@@ -546,7 +551,7 @@ def send_webhook(json_path, progress):
         with open(json_path, "r", encoding="utf-8") as f:
             data = json.load(f)
         headers = {"X-Webhook-Secret": WEBHOOK_SECRET} if WEBHOOK_SECRET else {}
-        r = requests.post(WEBHOOK_URL, json=data, headers=headers, timeout=30)
+        r = requests.post(ACTIVE_WEBHOOK_URL, json=data, headers=headers, timeout=30)
         if r.status_code == 200:
             log.info(f"   ✅ Webhook OK → status {r.status_code}")
             shutil.move(json_path, os.path.join(TRANSCRIPTS_DONE, filename))
@@ -777,7 +782,7 @@ def send_webhook_local(json_path, file_key, progress):
         with open(json_path, "r", encoding="utf-8") as f:
             data = json.load(f)
         headers = {"X-Webhook-Secret": WEBHOOK_SECRET} if WEBHOOK_SECRET else {}
-        r = requests.post(WEBHOOK_URL, json=data, headers=headers, timeout=30)
+        r = requests.post(ACTIVE_WEBHOOK_URL, json=data, headers=headers, timeout=30)
         if r.status_code == 200:
             log.info(f"   ✅ Webhook OK → status {r.status_code}")
             shutil.move(json_path, os.path.join(TRANSCRIPTS_DONE, filename))
@@ -875,6 +880,11 @@ ejemplos:
         action="store_true",
         help="Retomar desde progress.json, salteando los IDs ya DONE"
     )
+    parser.add_argument(
+        "--test",
+        action="store_true",
+        help="Usar WEBHOOK_URL_TEST del .env en lugar de WEBHOOK_URL (ambiente de pruebas)"
+    )
     args = parser.parse_args()
 
     # Crear carpetas base
@@ -883,8 +893,22 @@ ejemplos:
 
     setup_logging()
 
+    # Resolver URL de webhook según --test
+    global ACTIVE_WEBHOOK_URL
+    if args.test:
+        if not WEBHOOK_URL_TEST:
+            log.error("❌ --test activo pero WEBHOOK_URL_TEST no está definida en el .env")
+            sys.exit(1)
+        ACTIVE_WEBHOOK_URL = WEBHOOK_URL_TEST
+        log.info(f"🧪 Modo TEST activo → {ACTIVE_WEBHOOK_URL}")
+    else:
+        if not WEBHOOK_URL:
+            log.error("❌ WEBHOOK_URL no está definida en el .env")
+            sys.exit(1)
+        ACTIVE_WEBHOOK_URL = WEBHOOK_URL
+
     log.info(f"{'='*45}")
-    log.info(f"  ythelper | modo: {args.mode} | resume: {args.resume}")
+    log.info(f"  ythelper | modo: {args.mode} | test: {args.test} | resume: {args.resume}")
     log.info(f"{'='*45}")
 
     # Validación: local requiere --file o --local-folder
