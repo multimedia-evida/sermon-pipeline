@@ -39,7 +39,6 @@ Instalar tracking:
     pip install mediapipe opencv-python-headless
 """
 
-
 import argparse
 import json
 import logging
@@ -77,11 +76,13 @@ class Config:
     font_size:              int   = 72
     subtitle_y_pct:         float = 0.72
     max_chars_per_line:     int   = 28
+    crop_offset_x:          int   = 0      # offset manual en px (+ derecha, - izquierda)
     # Face tracking
     use_tracking:           bool  = True
-    crop_map_path:          Path  = None     # None → auto-resolve
+    crop_map_path:          Path  = None
     tracker_sample_rate:    int   = 1
     tracker_smooth_window:  int   = 3
+    sendcmd_interval:       float = 2.0    # segundos entre keyframes (más alto = más suave)
 
 
 # ──────────────────────────────────────────────
@@ -342,26 +343,21 @@ def compute_crop_width(src_w: int, src_h: int) -> int:
 
 
 def generate_sendcmd_file(
-    crop_map:   dict,
-    start_sec:  float,
-    end_sec:    float,
-    src_w:      int,
-    src_h:      int,
+    crop_map:    dict,
+    start_sec:   float,
+    end_sec:     float,
+    src_w:       int,
+    src_h:       int,
     output_path: Path,
+    cfg:         Config,
 ) -> tuple[int, int, int]:
     """
-    Genera un archivo sendcmd para ffmpeg que actualiza crop_x cada segundo.
+    Genera archivo sendcmd para ffmpeg con keyframes de crop_x.
 
-    El filtro sendcmd envía comandos a otros filtros en timestamps específicos.
-    Formato de cada línea:
-        T [out] filtro comando valor
+    Fix movimiento brusco: usar cfg.sendcmd_interval >= 2.0s entre keyframes.
+    Menos keyframes = transiciones más suaves porque ffmpeg interpola linealmente.
 
-    Retorna (crop_w, crop_h, crop_y) para usarlos en el filtro crop inicial.
-
-    Por qué sendcmd y no expresión inline:
-      - Las expresiones if(lte(t,...)) con decimales rompen el parser de ffmpeg
-      - sendcmd es el mecanismo oficial para parámetros variables por tiempo
-      - Soporta interpolación lineal nativa entre keyframes
+    Fix descentrado: aplicar cfg.crop_offset_x para corregir bias sistemático.
     """
     crop_w = crop_map["crop_width"]
     crop_h = src_h
@@ -369,21 +365,21 @@ def generate_sendcmd_file(
         crop_w = src_w
         crop_h = math.floor(src_w * 16 / 9)
 
-    crop_y   = (src_h - crop_h) // 2
+    crop_y     = (src_h - crop_h) // 2
     max_crop_x = src_w - crop_w
-    duration = end_sec - start_sec
+    duration   = end_sec - start_sec
 
-    # Muestrear cada 0.5s del clip (relativo a t=0 del clip)
-    sample_interval = 0.5
-    n_samples = max(2, int(duration / sample_interval) + 1)
+    # Keyframes cada sendcmd_interval segundos (default 2s → movimiento suave)
+    n_samples = max(2, int(duration / cfg.sendcmd_interval) + 1)
 
     lines = []
     for i in range(n_samples):
-        t_rel    = i * (duration / (n_samples - 1))
-        t_abs    = start_sec + t_rel
-        crop_x   = get_crop_x_at(crop_map, t_abs)
-        crop_x   = max(0, min(crop_x, max_crop_x))
-        # Formato sendcmd: TIME crop x VALUE
+        t_rel  = i * (duration / (n_samples - 1))
+        t_abs  = start_sec + t_rel
+        raw_x  = get_crop_x_at(crop_map, t_abs)
+        # Aplicar offset manual para corregir bias del tracker
+        crop_x = raw_x + cfg.crop_offset_x
+        crop_x = max(0, min(crop_x, max_crop_x))
         lines.append(f"{t_rel:.3f} crop x {crop_x};")
 
     with open(output_path, "w", encoding="utf-8") as f:
@@ -442,6 +438,44 @@ def wrap_for_ass(text: str, max_chars: int) -> str:
         lines.append(" ".join(current))
 
     return r"\N".join(lines)
+
+
+def chunk_segments(segments: list[dict], max_duration: float = 3.0) -> list[dict]:
+    """
+    Parte segmentos de Whisper que son demasiado largos en chunks más cortos.
+    Divide por palabras distribuyendo el tiempo proporcionalmente.
+    Esto evita que un segmento de 12s con 80 palabras llene toda la pantalla.
+    """
+    result = []
+    for seg in segments:
+        duration = seg["end"] - seg["start"]
+        if duration <= max_duration:
+            result.append(seg)
+            continue
+
+        # Dividir el texto en chunks de palabras
+        words    = seg["text"].split()
+        n_chunks = max(2, math.ceil(duration / max_duration))
+        chunk_size = max(1, len(words) // n_chunks)
+
+        word_chunks = []
+        for i in range(0, len(words), chunk_size):
+            word_chunks.append(words[i:i + chunk_size])
+
+        # Distribuir tiempo proporcionalmente al número de palabras
+        total_words = len(words)
+        t = seg["start"]
+        for chunk_words in word_chunks:
+            chunk_text     = " ".join(chunk_words)
+            chunk_duration = duration * len(chunk_words) / total_words
+            result.append({
+                "start": round(t, 3),
+                "end":   round(t + chunk_duration, 3),
+                "text":  chunk_text,
+            })
+            t += chunk_duration
+
+    return result
 
 
 def generate_ass(segments: list[dict], output_path: Path, cfg: Config) -> None:
@@ -613,21 +647,23 @@ def parse_args() -> Config:
     p.add_argument("--whisper",   required=True,
                    help="Archivo .json o directorio de transcripción Whisper")
     p.add_argument("--video",     required=True)
-    p.add_argument("--output",    default="./output")
+    p.add_argument("--output",    default="./data/output/shorts")
     p.add_argument("--resolution", default="1080x1920")
     p.add_argument("--no-concat", action="store_true")
     p.add_argument("--font-size", type=int,   default=72)
     p.add_argument("--subtitle-y", type=float, default=0.72)
     p.add_argument("--max-chars",  type=int,   default=28)
+    p.add_argument("--crop-offset", type=int,  default=0,
+                   help="Offset X del crop en px (+ derecha, - izquierda). Útil si el tracking está descentrado.")
     # Tracking
     p.add_argument("--no-tracking", action="store_true",
                    help="Deshabilitar face tracking (usar crop centrado)")
     p.add_argument("--crop-map", default=None,
                    help="Ruta custom al crop_map.json (omitir = auto)")
-    p.add_argument("--tracker-sample-rate",   type=int, default=1,
-                   help="FPS de análisis del tracker (default: 1)")
-    p.add_argument("--tracker-smooth-window", type=int, default=3,
-                   help="Segundos de suavizado del tracker (default: 3)")
+    p.add_argument("--tracker-sample-rate",   type=int,   default=1)
+    p.add_argument("--tracker-smooth-window", type=int,   default=3)
+    p.add_argument("--sendcmd-interval",      type=float, default=2.0,
+                   help="Segundos entre keyframes de crop (default: 2.0 → movimiento suave)")
     p.add_argument("--debug", action="store_true")
 
     args = p.parse_args()
@@ -648,10 +684,12 @@ def parse_args() -> Config:
         font_size              = args.font_size,
         subtitle_y_pct         = args.subtitle_y,
         max_chars_per_line     = args.max_chars,
+        crop_offset_x          = args.crop_offset,
         use_tracking           = not args.no_tracking,
         crop_map_path          = Path(args.crop_map) if args.crop_map else None,
         tracker_sample_rate    = args.tracker_sample_rate,
         tracker_smooth_window  = args.tracker_smooth_window,
+        sendcmd_interval       = args.sendcmd_interval,
     )
 
 
@@ -718,19 +756,19 @@ def main() -> None:
             km_id, len(key_moments), title, start, end
         )
 
-        # Subtítulos ASS
-        clip_segs = segments_for_range(all_segments, start, end)
-        log.info("   Segmentos Whisper: %d", len(clip_segs))
+        # Subtítulos ASS — partir segmentos largos en chunks de máx 3s
+        clip_segs   = segments_for_range(all_segments, start, end)
+        clip_segs   = chunk_segments(clip_segs, max_duration=3.0)
+        log.info("   Segmentos subtítulos: %d (tras chunking)", len(clip_segs))
         generate_ass(clip_segs, ass_path, cfg)
 
         # Crop params + sendcmd
         if crop_map:
             crop_w, crop_h, crop_y = generate_sendcmd_file(
-                crop_map, start, end, src_w, src_h, sendcmd_path
+                crop_map, start, end, src_w, src_h, sendcmd_path, cfg
             )
-            # crop_x inicial = posición en t=start
             crop_x = get_crop_x_at(crop_map, start)
-            crop_x = max(0, min(crop_x, src_w - crop_w))
+            crop_x = max(0, min(crop_x + cfg.crop_offset_x, src_w - crop_w))
             log.debug("   Sendcmd generado: %s", sendcmd_path.name)
         else:
             crop_w, crop_h, crop_x, crop_y = static_crop_params(src_w, src_h)
