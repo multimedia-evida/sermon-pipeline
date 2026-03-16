@@ -1,3 +1,45 @@
+#!/usr/bin/env python3
+"""
+generate_shorts.py  v3
+======================
+Genera clips verticales 9:16 (Shorts/Reels) desde un video horizontal,
+usando los key_moments del JSON procesado por IA, segmentos Whisper como
+subtítulos y face tracking dinámico con suavizado.
+
+Cambios v3:
+  - Integra face_tracker.py: lo invoca automáticamente si no existe crop_map.json
+  - Crop dinámico suave: el encuadre sigue al rostro interpolando crop_x por frame
+  - Fallback robusto: si el tracking falla, usa crop centrado
+
+Uso:
+    python generate_shorts.py \
+        --predica   wxM8MkMKvNE_predica.json \
+        --whisper   ./transcripts/done/ \
+        --video     /mnt/nas/predicas/20260315_wxM8MkMKvNE.mp4 \
+        --output    ./output/shorts
+
+Opcionales:
+    --resolution    1080x1920
+    --no-concat
+    --font-size     72
+    --subtitle-y    0.72
+    --max-chars     28
+    --crop-map      ./output/shorts/crop_map.json   (ruta custom al caché)
+    --no-tracking                                   (deshabilita face tracking)
+    --tracker-sample-rate   1                       (fps de análisis del tracker)
+    --tracker-smooth-window 3                       (segundos de suavizado)
+    --debug
+
+Dependencias:
+    - ffmpeg >= 4.4 con libass
+    - Python 3.8+
+    - mediapipe + opencv-python-headless  (solo para face tracking)
+
+Instalar tracking:
+    pip install mediapipe opencv-python-headless
+"""
+
+
 import argparse
 import json
 import logging
@@ -341,8 +383,8 @@ def generate_sendcmd_file(
         t_abs    = start_sec + t_rel
         crop_x   = get_crop_x_at(crop_map, t_abs)
         crop_x   = max(0, min(crop_x, max_crop_x))
-        # Formato sendcmd: TIME [out] crop x VALUE
-        lines.append(f"{t_rel:.3f} [out] crop x {crop_x};")
+        # Formato sendcmd: TIME crop x VALUE
+        lines.append(f"{t_rel:.3f} crop x {crop_x};")
 
     with open(output_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
