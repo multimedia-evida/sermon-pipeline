@@ -1,42 +1,3 @@
-#!/usr/bin/env python3
-"""
-generate_shorts.py
-==================
-Genera clips verticales 9:16 (Shorts/Reels) desde un video horizontal,
-usando los key_moments del JSON procesado por IA y los segmentos de
-Whisper como subtítulos.
-
-Uso:
-    python generate_shorts.py \
-        --predica   ~/repo/sermon-pipeline/data/input/ai-json/'wxM8MkMKvNE_¿Podrías vivir sin Dios_ - Pr. Beto Tassara.json' \
-        --whisper   /home/evida/repo/sermon-pipeline/data/output/transcripts/done/20260315_wxM8MkMKvNE.json \
-        --video     /mnt/nas/predicas/20260315_wxM8MkMKvNE.mp4 \
-        --output    ./output/shorts \
-        [--resolution 1080x1920] \
-        [--crop-offset 0] \
-        [--no-concat]
-
-Opcionales:
-    --resolution    1080x1920
-    --no-concat
-    --font-size     72
-    --subtitle-y    0.72
-    --max-chars     28
-    --crop-map      ./output/shorts/crop_map.json   (ruta custom al caché)
-    --no-tracking                                   (deshabilita face tracking)
-    --tracker-sample-rate   1                       (fps de análisis del tracker)
-    --tracker-smooth-window 3                       (segundos de suavizado)
-    --debug
-
-Dependencias:
-    - ffmpeg >= 4.4 con libass
-    - Python 3.8+
-    - mediapipe + opencv-python-headless  (solo para face tracking)
-
-Instalar tracking:
-    pip install mediapipe opencv-python-headless
-"""
-
 import argparse
 import json
 import logging
@@ -328,7 +289,7 @@ def get_crop_x_at(crop_map: dict, t_sec: float) -> int:
 
 
 # ──────────────────────────────────────────────
-# CROP DINÁMICO — GENERACIÓN DE FILTRO
+# CROP DINÁMICO — SENDCMD
 # ──────────────────────────────────────────────
 
 def compute_crop_width(src_w: int, src_h: int) -> int:
@@ -338,24 +299,27 @@ def compute_crop_width(src_w: int, src_h: int) -> int:
     return crop_w
 
 
-def build_dynamic_crop_filter(
+def generate_sendcmd_file(
     crop_map:   dict,
     start_sec:  float,
     end_sec:    float,
     src_w:      int,
     src_h:      int,
-    fps:        float,
-) -> str:
+    output_path: Path,
+) -> tuple[int, int, int]:
     """
-    Genera una expresión de crop dinámico para ffmpeg usando la función crop
-    con expresión de tiempo 't'.
+    Genera un archivo sendcmd para ffmpeg que actualiza crop_x cada segundo.
 
-    Estrategia: genera una expresión ffmpeg usando 'if(between(t,...))' para
-    cada intervalo de 1 segundo del clip. Es verboso pero garantiza fluidez
-    porque usa interpolación dentro de cada intervalo.
+    El filtro sendcmd envía comandos a otros filtros en timestamps específicos.
+    Formato de cada línea:
+        T [out] filtro comando valor
 
-    Para clips cortos (<= 180s) esto es manejable (~180 expresiones).
-    Para clips más largos, reduce la densidad automáticamente.
+    Retorna (crop_w, crop_h, crop_y) para usarlos en el filtro crop inicial.
+
+    Por qué sendcmd y no expresión inline:
+      - Las expresiones if(lte(t,...)) con decimales rompen el parser de ffmpeg
+      - sendcmd es el mecanismo oficial para parámetros variables por tiempo
+      - Soporta interpolación lineal nativa entre keyframes
     """
     crop_w = crop_map["crop_width"]
     crop_h = src_h
@@ -363,59 +327,32 @@ def build_dynamic_crop_filter(
         crop_w = src_w
         crop_h = math.floor(src_w * 16 / 9)
 
-    crop_y = (src_h - crop_h) // 2
+    crop_y   = (src_h - crop_h) // 2
+    max_crop_x = src_w - crop_w
     duration = end_sec - start_sec
 
-    # Muestrear la posición X cada 0.5s dentro del clip
-    # Usa interpolación lineal entre muestras para suavidad
+    # Muestrear cada 0.5s del clip (relativo a t=0 del clip)
     sample_interval = 0.5
     n_samples = max(2, int(duration / sample_interval) + 1)
-    times  = [start_sec + i * (duration / (n_samples - 1)) for i in range(n_samples)]
-    crop_xs = [get_crop_x_at(crop_map, t) for t in times]
 
-    # Construir expresión ffmpeg con lerp entre keyframes
-    # t_rel = tiempo relativo al inicio del clip (PTS-STARTPTS ya aplicado antes del crop)
-    # ffmpeg permite expresiones con 'if', 'between', operaciones aritméticas
-    #
-    # Forma: construir expresión piecewise linear con 'if(lte(t, T1), lerp, rest)'
-    # Para N keyframes: if(lte(t,t1), x0+(x1-x0)*(t-t0)/(t1-t0), if(lte(t,t2), ..., xN))
+    lines = []
+    for i in range(n_samples):
+        t_rel    = i * (duration / (n_samples - 1))
+        t_abs    = start_sec + t_rel
+        crop_x   = get_crop_x_at(crop_map, t_abs)
+        crop_x   = max(0, min(crop_x, max_crop_x))
+        # Formato sendcmd: TIME [out] crop x VALUE
+        lines.append(f"{t_rel:.3f} [out] crop x {crop_x};")
 
-    # Tiempos relativos al clip
-    rel_times = [t - start_sec for t in times]
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+        f.write("\n")
 
-    # Construir expresión anidada (de adentro hacia afuera)
-    # El último segmento es el valor final
-    expr = str(crop_xs[-1])
-
-    for i in range(n_samples - 2, -1, -1):
-        t0_r = rel_times[i]
-        t1_r = rel_times[i + 1]
-        x0   = crop_xs[i]
-        x1   = crop_xs[i + 1]
-        dt   = t1_r - t0_r
-
-        if dt < 0.001:
-            lerp = str(x0)
-        else:
-            # lerp = x0 + (x1-x0) * (t - t0) / dt
-            dx = x1 - x0
-            if dx == 0:
-                lerp = str(x0)
-            else:
-                sign = "+" if dx > 0 else "-"
-                lerp = f"{x0}{sign}{abs(dx)}*(t-{t0_r:.3f})/{dt:.3f}"
-
-        expr = f"if(lte(t,{t1_r:.3f}),{lerp},{expr})"
-
-    # Clampear al rango válido
-    max_x = src_w - crop_w
-    expr_clamped = f"clip({expr},0,{max_x})"
-
-    return f"crop={crop_w}:{crop_h}:{expr_clamped}:{crop_y}"
+    return crop_w, crop_h, crop_y
 
 
-def build_static_crop_filter(src_w: int, src_h: int, offset_x: int = 0) -> str:
-    """Crop fijo centrado (fallback cuando no hay tracking)."""
+def static_crop_params(src_w: int, src_h: int, offset_x: int = 0) -> tuple[int, int, int, int]:
+    """Retorna (crop_w, crop_h, crop_x, crop_y) para crop fijo centrado."""
     crop_w = math.floor(src_h * 9 / 16)
     if crop_w > src_w:
         crop_w = src_w
@@ -423,11 +360,9 @@ def build_static_crop_filter(src_w: int, src_h: int, offset_x: int = 0) -> str:
     else:
         crop_h = src_h
 
-    crop_x = max(0, (src_w - crop_w) // 2 + offset_x)
-    crop_x = min(crop_x, src_w - crop_w)
+    crop_x = max(0, min((src_w - crop_w) // 2 + offset_x, src_w - crop_w))
     crop_y = (src_h - crop_h) // 2
-
-    return f"crop={crop_w}:{crop_h}:{crop_x}:{crop_y}"
+    return crop_w, crop_h, crop_x, crop_y
 
 
 # ──────────────────────────────────────────────
@@ -512,25 +447,61 @@ def generate_ass(segments: list[dict], output_path: Path, cfg: Config) -> None:
 # FFMPEG COMMAND BUILDER
 # ──────────────────────────────────────────────
 
+# ──────────────────────────────────────────────
+# FFMPEG COMMAND BUILDER
+# ──────────────────────────────────────────────
+
 def build_ffmpeg_cmd(
     video_path:   Path,
     output_path:  Path,
     ass_path:     Path,
     start_sec:    float,
     end_sec:      float,
-    crop_filter:  str,
+    crop_w:       int,
+    crop_h:       int,
+    crop_x:       int,      # posición inicial (o fija si no hay tracking)
+    crop_y:       int,
     cfg:          Config,
+    sendcmd_path: Path | None = None,   # None = crop estático
 ) -> list[str]:
-    duration  = end_sec - start_sec
-    ass_str   = str(ass_path.resolve())
+    """
+    Construye comando ffmpeg.
 
-    vf = (
-        f"trim=start={start_sec}:end={end_sec},"
-        f"setpts=PTS-STARTPTS,"
-        f"{crop_filter},"
-        f"scale={cfg.width}:{cfg.height}:flags=lanczos,"
-        f"subtitles='{ass_str}'"
-    )
+    Con tracking (sendcmd_path definido):
+        trim → setpts → crop(inicial) → sendcmd(actualiza x) → scale → subtitles
+
+    Sin tracking:
+        trim → setpts → crop(fijo) → scale → subtitles
+
+    Por qué sendcmd fuera del -vf:
+        ffmpeg acepta -vf "sendcmd=f=archivo.txt,crop=...,scale=..."
+        El sendcmd envía comandos al filtro crop que le sigue en la cadena.
+    """
+    duration = end_sec - start_sec
+    ass_str  = str(ass_path.resolve())
+
+    if sendcmd_path:
+        # Crop dinámico: sendcmd actualiza el parámetro x del filtro crop
+        # en cada timestamp definido en el archivo
+        sendcmd_str = str(sendcmd_path.resolve())
+        vf = (
+            f"trim=start={start_sec}:end={end_sec},"
+            f"setpts=PTS-STARTPTS,"
+            f"sendcmd=f='{sendcmd_str}',"
+            f"crop={crop_w}:{crop_h}:{crop_x}:{crop_y},"
+            f"scale={cfg.width}:{cfg.height}:flags=lanczos,"
+            f"subtitles='{ass_str}'"
+        )
+    else:
+        # Crop estático fijo
+        vf = (
+            f"trim=start={start_sec}:end={end_sec},"
+            f"setpts=PTS-STARTPTS,"
+            f"crop={crop_w}:{crop_h}:{crop_x}:{crop_y},"
+            f"scale={cfg.width}:{cfg.height}:flags=lanczos,"
+            f"subtitles='{ass_str}'"
+        )
+
     af = f"atrim=start={start_sec}:end={end_sec},asetpts=PTS-STARTPTS"
 
     return [
@@ -677,11 +648,9 @@ def main() -> None:
     crop_map = load_or_generate_crop_map(cfg)
 
     if crop_map:
-        log.info("Face tracking: ACTIVO (crop dinámico)")
-        fps = get_video_fps(cfg.video_path)
+        log.info("Face tracking: ACTIVO (crop dinámico via sendcmd)")
     else:
         log.info("Face tracking: INACTIVO (crop centrado fijo)")
-        fps = None
 
     log.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     log.info("Video:       %s  (%dx%d)", cfg.video_path.name, src_w, src_h)
@@ -697,38 +666,46 @@ def main() -> None:
         start  = float(km["start_seconds"])
         end    = float(km["end_seconds"])
 
-        safe_title = re.sub(r"[^\w\s\-]", "_", title).strip().replace(" ", "_")[:50]
-        clip_path  = cfg.output_dir / f"{km_id:02d}_{safe_title}.mp4"
-        ass_path   = ass_dir        / f"{km_id:02d}_{safe_title}.ass"
+        safe_title    = re.sub(r"[^\w\s\-]", "_", title).strip().replace(" ", "_")[:50]
+        clip_path     = cfg.output_dir / f"{km_id:02d}_{safe_title}.mp4"
+        ass_path      = ass_dir        / f"{km_id:02d}_{safe_title}.ass"
+        sendcmd_path  = ass_dir        / f"{km_id:02d}_{safe_title}.sendcmd"
 
         log.info(
             "── [%d/%d] %s  [%.0fs → %.0fs]",
             km_id, len(key_moments), title, start, end
         )
 
-        # Subtítulos
+        # Subtítulos ASS
         clip_segs = segments_for_range(all_segments, start, end)
         log.info("   Segmentos Whisper: %d", len(clip_segs))
         generate_ass(clip_segs, ass_path, cfg)
 
-        # Crop filter
+        # Crop params + sendcmd
         if crop_map:
-            crop_filter = build_dynamic_crop_filter(
-                crop_map, start, end, src_w, src_h, fps
+            crop_w, crop_h, crop_y = generate_sendcmd_file(
+                crop_map, start, end, src_w, src_h, sendcmd_path
             )
-            log.debug("   Crop dinámico generado")
+            # crop_x inicial = posición en t=start
+            crop_x = get_crop_x_at(crop_map, start)
+            crop_x = max(0, min(crop_x, src_w - crop_w))
+            log.debug("   Sendcmd generado: %s", sendcmd_path.name)
         else:
-            crop_filter = build_static_crop_filter(src_w, src_h)
-            log.debug("   Crop estático centrado")
+            crop_w, crop_h, crop_x, crop_y = static_crop_params(src_w, src_h)
+            sendcmd_path = None
 
         cmd = build_ffmpeg_cmd(
-            video_path  = cfg.video_path,
-            output_path = clip_path,
-            ass_path    = ass_path,
-            start_sec   = start,
-            end_sec     = end,
-            crop_filter = crop_filter,
-            cfg         = cfg,
+            video_path   = cfg.video_path,
+            output_path  = clip_path,
+            ass_path     = ass_path,
+            start_sec    = start,
+            end_sec      = end,
+            crop_w       = crop_w,
+            crop_h       = crop_h,
+            crop_x       = crop_x,
+            crop_y       = crop_y,
+            cfg          = cfg,
+            sendcmd_path = sendcmd_path,
         )
 
         if run_ffmpeg(cmd, f"{km_id:02d}_{safe_title}"):
