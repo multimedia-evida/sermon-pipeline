@@ -8,18 +8,33 @@ Whisper como subtítulos.
 
 Uso:
     python generate_shorts.py \
-        --predica   dBp8VW3rAdQ_Pure_De_Papas.json \
-        --whisper   20250721_dBp8VW3rAdQ_Pure_De_Papas.json \
-        --video     video.mp4 \
-        --output    ./output \
+        --predica   ~/repo/sermon-pipeline/data/input/ai-json/'wxM8MkMKvNE_¿Podrías vivir sin Dios_ - Pr. Beto Tassara.json' \
+        --whisper   /home/evida/repo/sermon-pipeline/data/output/transcripts/done/20260315_wxM8MkMKvNE.json \
+        --video     /mnt/nas/predicas/20260315_wxM8MkMKvNE.mp4 \
+        --output    ./output/shorts \
         [--resolution 1080x1920] \
         [--crop-offset 0] \
         [--no-concat]
 
+Opcionales:
+    --resolution    1080x1920
+    --no-concat
+    --font-size     72
+    --subtitle-y    0.72
+    --max-chars     28
+    --crop-map      ./output/shorts/crop_map.json   (ruta custom al caché)
+    --no-tracking                                   (deshabilita face tracking)
+    --tracker-sample-rate   1                       (fps de análisis del tracker)
+    --tracker-smooth-window 3                       (segundos de suavizado)
+    --debug
+
 Dependencias:
-    - ffmpeg >= 4.4 (en PATH)
+    - ffmpeg >= 4.4 con libass
     - Python 3.8+
-    - No requiere librerías externas de Python
+    - mediapipe + opencv-python-headless  (solo para face tracking)
+
+Instalar tracking:
+    pip install mediapipe opencv-python-headless
 """
 
 import argparse
@@ -27,17 +42,13 @@ import json
 import logging
 import math
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
-
-# ──────────────────────────────────────────────
-# CONFIG
-# ──────────────────────────────────────────────
 
 logging.basicConfig(
     level=logging.INFO,
@@ -47,42 +58,58 @@ logging.basicConfig(
 log = logging.getLogger("generate_shorts")
 
 
+# ──────────────────────────────────────────────
+# CONFIG
+# ──────────────────────────────────────────────
+
 @dataclass
 class Config:
-    predica_json: Path
-    whisper_json: Path
-    video_path: Path
-    output_dir: Path
-    width: int = 1080
-    height: int = 1920
-    crop_offset_x: int = 0          # offset horizontal manual (px sobre el video original)
-    concat: bool = True             # generar también un video compilado
-    font_size: int = 60             # tamaño base de fuente para subtítulos
-    font_color: str = "white"
-    font_outline_color: str = "black"
-    font_outline_width: int = 4
-    subtitle_margin_bottom: int = 200   # px desde el fondo del frame vertical
-    max_chars_per_line: int = 35        # wrap de texto
+    predica_json:           Path
+    whisper_path:           Path
+    video_path:             Path
+    output_dir:             Path
+    width:                  int   = 1080
+    height:                 int   = 1920
+    concat:                 bool  = True
+    font_size:              int   = 72
+    subtitle_y_pct:         float = 0.72
+    max_chars_per_line:     int   = 28
+    # Face tracking
+    use_tracking:           bool  = True
+    crop_map_path:          Path  = None     # None → auto-resolve
+    tracker_sample_rate:    int   = 1
+    tracker_smooth_window:  int   = 3
 
 
 # ──────────────────────────────────────────────
-# HELPERS
+# SAFE ZONE REFERENCE
+# ──────────────────────────────────────────────
+#
+#  1920px
+#  ┌──────────────────────────┐ 0
+#  │  TOP UNSAFE   (0-8%)     │
+#  ├──────────────────────────┤ ~154px
+#  │   SAFE ZONE              │
+#  ├──────────────────────────┤ ~1382px  ← subtitle_y_pct=0.72
+#  │  SUBTÍTULOS              │
+#  ├──────────────────────────┤ ~1536px
+#  │  BOTTOM UNSAFE (80-100%) │ ← controles app
+#  └──────────────────────────┘ 1920px
+
+
+# ──────────────────────────────────────────────
+# FFMPEG
 # ──────────────────────────────────────────────
 
 def check_ffmpeg() -> None:
-    """Verifica que ffmpeg esté disponible en PATH."""
     if not shutil.which("ffmpeg"):
-        log.error("ffmpeg no encontrado en PATH. Instalalo con: apt install ffmpeg")
+        log.error("ffmpeg no encontrado. Instalalo con: sudo apt install ffmpeg")
         sys.exit(1)
-    result = subprocess.run(
-        ["ffmpeg", "-version"], capture_output=True, text=True
-    )
-    version_line = result.stdout.splitlines()[0]
-    log.info("ffmpeg encontrado: %s", version_line)
+    r = subprocess.run(["ffmpeg", "-version"], capture_output=True, text=True)
+    log.info("ffmpeg: %s", r.stdout.splitlines()[0])
 
 
 def get_video_dimensions(video_path: Path) -> tuple[int, int]:
-    """Devuelve (width, height) del video usando ffprobe."""
     cmd = [
         "ffprobe", "-v", "error",
         "-select_streams", "v:0",
@@ -90,256 +117,450 @@ def get_video_dimensions(video_path: Path) -> tuple[int, int]:
         "-of", "csv=s=x:p=0",
         str(video_path),
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        log.error("ffprobe falló: %s", result.stderr)
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        log.error("ffprobe falló: %s", r.stderr)
         sys.exit(1)
-    w, h = result.stdout.strip().split("x")
+    w, h = r.stdout.strip().split("x")
     return int(w), int(h)
 
 
+def get_video_fps(video_path: Path) -> float:
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=r_frame_rate",
+        "-of", "csv=p=0",
+        str(video_path),
+    ]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    num, den = r.stdout.strip().split("/")
+    return float(num) / float(den)
+
+
+# ──────────────────────────────────────────────
+# JSON LOADERS
+# ──────────────────────────────────────────────
+
 def load_predica_json(path: Path) -> dict:
-    """Carga el JSON procesado por IA. Soporta lista o dict."""
     with open(path, encoding="utf-8") as f:
         data = json.load(f)
-    # El JSON puede ser una lista con un único elemento (formato n8n)
     if isinstance(data, list):
         data = data[0]
-    # Navegar hasta output si existe
     if "output" in data:
         data = data["output"]
     return data
 
 
-def load_whisper_json(path: Path) -> list[dict]:
-    """
-    Carga los segmentos de Whisper.
-    Soporta:
-      - {"segments": [...]}        ← formato del proyecto
-      - [{"start":..., "text":...}]  ← lista directa
-    """
+def extract_video_id(predica_path: Path) -> str:
+    stem = predica_path.stem
+    stem_clean = re.sub(r'^\d{8}_', '', stem)
+    match = re.match(r'([A-Za-z0-9_\-]{11})', stem_clean)
+    if match:
+        return match.group(1)
+    parts = stem.split("_")
+    for p in parts:
+        if len(p) == 11 and re.match(r'^[A-Za-z0-9_\-]+$', p):
+            return p
+    return parts[0]
+
+
+def resolve_whisper_path(whisper_path: Path, predica_path: Path) -> Path:
+    if whisper_path.is_file():
+        return whisper_path
+    if not whisper_path.is_dir():
+        log.error("--whisper no es un archivo ni directorio: %s", whisper_path)
+        sys.exit(1)
+    video_id   = extract_video_id(predica_path)
+    candidates = [p for p in whisper_path.glob("*.json") if video_id in p.stem]
+    if not candidates:
+        available = [p.name for p in whisper_path.glob("*.json")]
+        log.error(
+            "No se encontró Whisper JSON para videoId '%s' en %s\n"
+            "Disponibles: %s",
+            video_id, whisper_path,
+            available if available else "(ninguno)"
+        )
+        sys.exit(1)
+    if len(candidates) > 1:
+        log.warning("Múltiples candidatos Whisper, usando: %s", candidates[0].name)
+    log.info("Whisper JSON: %s", candidates[0].name)
+    return candidates[0]
+
+
+def load_whisper_segments(path: Path) -> list[dict]:
     with open(path, encoding="utf-8") as f:
         data = json.load(f)
     if isinstance(data, dict) and "segments" in data:
         return data["segments"]
     if isinstance(data, list):
         return data
-    log.error("Formato de Whisper JSON no reconocido.")
+    log.error("Formato Whisper JSON no reconocido: %s", path)
     sys.exit(1)
 
 
-def escape_drawtext(text: str) -> str:
+def segments_for_range(
+    segments: list[dict], start_sec: float, end_sec: float
+) -> list[dict]:
+    result = []
+    for seg in segments:
+        s, e = float(seg["start"]), float(seg["end"])
+        if e <= start_sec or s >= end_sec:
+            continue
+        cs = max(s, start_sec) - start_sec
+        ce = min(e, end_sec)   - start_sec
+        if ce - cs < 0.1:
+            continue
+        result.append({
+            "start": round(cs, 3),
+            "end":   round(ce, 3),
+            "text":  seg["text"].strip(),
+        })
+    return result
+
+
+# ──────────────────────────────────────────────
+# FACE TRACKING — CACHÉ Y AUTO-INVOCACIÓN
+# ──────────────────────────────────────────────
+
+def resolve_crop_map_path(cfg: Config) -> Path:
+    """Determina la ruta del crop_map.json (custom o auto-generada)."""
+    if cfg.crop_map_path:
+        return cfg.crop_map_path
+    # Convención: mismo directorio de salida, nombre basado en el video
+    stem = cfg.video_path.stem
+    return cfg.output_dir / f"{stem}_crop_map.json"
+
+
+def load_or_generate_crop_map(cfg: Config) -> dict | None:
     """
-    Escapa caracteres especiales para el filtro drawtext de ffmpeg.
-    Referencia: https://ffmpeg.org/ffmpeg-filters.html#drawtext
+    Carga el crop_map.json si existe.
+    Si no existe, invoca face_tracker.py para generarlo.
+    Retorna None si el tracking está deshabilitado.
     """
-    # Orden importa: primero backslash
-    replacements = [
-        ("\\", "\\\\"),
-        ("'",  "\u2019"),   # reemplaza comilla simple por curva (más seguro)
-        (":",  "\\:"),
-        ("%",  "\\%"),
-        ("\n", " "),
+    if not cfg.use_tracking:
+        log.info("Face tracking deshabilitado (--no-tracking).")
+        return None
+
+    crop_map_path = resolve_crop_map_path(cfg)
+
+    # ── Caché hit ──
+    if crop_map_path.exists():
+        log.info("Caché de tracking encontrado: %s", crop_map_path.name)
+        with open(crop_map_path, encoding="utf-8") as f:
+            crop_map = json.load(f)
+        log.info(
+            "  %d entradas · %.1f%% detección · suavizado %ds",
+            len(crop_map.get("entries", [])),
+            crop_map.get("detection_rate_pct", 0),
+            crop_map.get("smooth_window", 0),
+        )
+        return crop_map
+
+    # ── Caché miss → invocar face_tracker.py ──
+    log.info("crop_map.json no encontrado. Invocando face_tracker.py...")
+
+    tracker_script = Path(__file__).parent / "face_tracker.py"
+    if not tracker_script.exists():
+        log.error(
+            "face_tracker.py no encontrado en %s\n"
+            "Copialo junto a generate_shorts.py o usá --no-tracking.",
+            tracker_script.parent
+        )
+        log.warning("Continuando sin face tracking (crop centrado).")
+        return None
+
+    cmd = [
+        sys.executable,           # mismo intérprete Python del venv
+        str(tracker_script),
+        "--video",   str(cfg.video_path),
+        "--output",  str(crop_map_path),
+        "--sample-rate",   str(cfg.tracker_sample_rate),
+        "--smooth-window", str(cfg.tracker_smooth_window),
     ]
-    for old, new in replacements:
-        text = text.replace(old, new)
-    return text
+
+    log.info("CMD: %s", " ".join(cmd))
+    r = subprocess.run(cmd)   # hereda stdout/stderr para ver el progreso
+
+    if r.returncode != 0:
+        log.error("face_tracker.py falló (código %d).", r.returncode)
+        log.warning("Continuando sin face tracking (crop centrado).")
+        return None
+
+    if not crop_map_path.exists():
+        log.error("face_tracker.py terminó pero no generó el archivo.")
+        return None
+
+    with open(crop_map_path, encoding="utf-8") as f:
+        return json.load(f)
 
 
-def wrap_text(text: str, max_chars: int) -> str:
+def get_crop_x_at(crop_map: dict, t_sec: float) -> int:
     """
-    Hace word-wrap básico insertando \\n para ffmpeg drawtext.
-    Retorna el texto con saltos de línea escapados para drawtext.
+    Interpolación lineal del crop_x para un tiempo dado.
+    Importado conceptualmente de face_tracker.py para mantener el módulo independiente.
     """
+    entries = crop_map["entries"]
+    if not entries:
+        return (crop_map["src_width"] - crop_map["crop_width"]) // 2
+
+    if t_sec <= entries[0]["t"]:
+        return entries[0]["crop_x"]
+    if t_sec >= entries[-1]["t"]:
+        return entries[-1]["crop_x"]
+
+    lo, hi = 0, len(entries) - 1
+    while lo < hi - 1:
+        mid = (lo + hi) // 2
+        if entries[mid]["t"] <= t_sec:
+            lo = mid
+        else:
+            hi = mid
+
+    t0, x0 = entries[lo]["t"], entries[lo]["crop_x"]
+    t1, x1 = entries[hi]["t"], entries[hi]["crop_x"]
+
+    if t1 == t0:
+        return x0
+
+    alpha = (t_sec - t0) / (t1 - t0)
+    return int(x0 + alpha * (x1 - x0))
+
+
+# ──────────────────────────────────────────────
+# CROP DINÁMICO — GENERACIÓN DE FILTRO
+# ──────────────────────────────────────────────
+
+def compute_crop_width(src_w: int, src_h: int) -> int:
+    crop_w = math.floor(src_h * 9 / 16)
+    if crop_w > src_w:
+        crop_w = src_w
+    return crop_w
+
+
+def build_dynamic_crop_filter(
+    crop_map:   dict,
+    start_sec:  float,
+    end_sec:    float,
+    src_w:      int,
+    src_h:      int,
+    fps:        float,
+) -> str:
+    """
+    Genera una expresión de crop dinámico para ffmpeg usando la función crop
+    con expresión de tiempo 't'.
+
+    Estrategia: genera una expresión ffmpeg usando 'if(between(t,...))' para
+    cada intervalo de 1 segundo del clip. Es verboso pero garantiza fluidez
+    porque usa interpolación dentro de cada intervalo.
+
+    Para clips cortos (<= 180s) esto es manejable (~180 expresiones).
+    Para clips más largos, reduce la densidad automáticamente.
+    """
+    crop_w = crop_map["crop_width"]
+    crop_h = src_h
+    if crop_w > src_w:
+        crop_w = src_w
+        crop_h = math.floor(src_w * 16 / 9)
+
+    crop_y = (src_h - crop_h) // 2
+    duration = end_sec - start_sec
+
+    # Muestrear la posición X cada 0.5s dentro del clip
+    # Usa interpolación lineal entre muestras para suavidad
+    sample_interval = 0.5
+    n_samples = max(2, int(duration / sample_interval) + 1)
+    times  = [start_sec + i * (duration / (n_samples - 1)) for i in range(n_samples)]
+    crop_xs = [get_crop_x_at(crop_map, t) for t in times]
+
+    # Construir expresión ffmpeg con lerp entre keyframes
+    # t_rel = tiempo relativo al inicio del clip (PTS-STARTPTS ya aplicado antes del crop)
+    # ffmpeg permite expresiones con 'if', 'between', operaciones aritméticas
+    #
+    # Forma: construir expresión piecewise linear con 'if(lte(t, T1), lerp, rest)'
+    # Para N keyframes: if(lte(t,t1), x0+(x1-x0)*(t-t0)/(t1-t0), if(lte(t,t2), ..., xN))
+
+    # Tiempos relativos al clip
+    rel_times = [t - start_sec for t in times]
+
+    # Construir expresión anidada (de adentro hacia afuera)
+    # El último segmento es el valor final
+    expr = str(crop_xs[-1])
+
+    for i in range(n_samples - 2, -1, -1):
+        t0_r = rel_times[i]
+        t1_r = rel_times[i + 1]
+        x0   = crop_xs[i]
+        x1   = crop_xs[i + 1]
+        dt   = t1_r - t0_r
+
+        if dt < 0.001:
+            lerp = str(x0)
+        else:
+            # lerp = x0 + (x1-x0) * (t - t0) / dt
+            dx = x1 - x0
+            if dx == 0:
+                lerp = str(x0)
+            else:
+                sign = "+" if dx > 0 else "-"
+                lerp = f"{x0}{sign}{abs(dx)}*(t-{t0_r:.3f})/{dt:.3f}"
+
+        expr = f"if(lte(t,{t1_r:.3f}),{lerp},{expr})"
+
+    # Clampear al rango válido
+    max_x = src_w - crop_w
+    expr_clamped = f"clip({expr},0,{max_x})"
+
+    return f"crop={crop_w}:{crop_h}:{expr_clamped}:{crop_y}"
+
+
+def build_static_crop_filter(src_w: int, src_h: int, offset_x: int = 0) -> str:
+    """Crop fijo centrado (fallback cuando no hay tracking)."""
+    crop_w = math.floor(src_h * 9 / 16)
+    if crop_w > src_w:
+        crop_w = src_w
+        crop_h = math.floor(src_w * 16 / 9)
+    else:
+        crop_h = src_h
+
+    crop_x = max(0, (src_w - crop_w) // 2 + offset_x)
+    crop_x = min(crop_x, src_w - crop_w)
+    crop_y = (src_h - crop_h) // 2
+
+    return f"crop={crop_w}:{crop_h}:{crop_x}:{crop_y}"
+
+
+# ──────────────────────────────────────────────
+# ASS SUBTITLES
+# ──────────────────────────────────────────────
+
+def seconds_to_ass(t: float) -> str:
+    h  = int(t // 3600)
+    m  = int((t % 3600) // 60)
+    s  = int(t % 60)
+    cs = int(round((t % 1) * 100))
+    return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
+
+
+def wrap_for_ass(text: str, max_chars: int) -> str:
     words = text.split()
-    lines = []
-    current = []
+    if not words or len(text) <= max_chars:
+        return text
+
+    lines:   list[str] = []
+    current: list[str] = []
     current_len = 0
 
     for word in words:
-        if current_len + len(word) + len(current) > max_chars:
+        wlen = len(word)
+        if current and current_len + 1 + wlen > max_chars:
             lines.append(" ".join(current))
-            current = [word]
-            current_len = len(word)
+            current     = [word]
+            current_len = wlen
         else:
+            current_len += (1 + wlen) if current_len > 0 else wlen
             current.append(word)
-            current_len += len(word)
 
     if current:
         lines.append(" ".join(current))
 
-    return "\\n".join(lines)
+    return r"\N".join(lines)
 
 
-def segments_for_range(
-    segments: list[dict],
-    start_sec: float,
-    end_sec: float,
-) -> list[dict]:
-    """
-    Filtra y re-temporiza segmentos de Whisper para un rango dado.
-    Los timestamps resultantes son relativos al inicio del clip (t=0).
-    """
-    result = []
-    for seg in segments:
-        seg_start = seg["start"]
-        seg_end = seg["end"]
+def generate_ass(segments: list[dict], output_path: Path, cfg: Config) -> None:
+    margin_v    = int(cfg.height * (1.0 - cfg.subtitle_y_pct))
+    col_white   = "&H00FFFFFF"
+    col_black   = "&H00000000"
+    col_shadow  = "&H88000000"
 
-        # Descarte si no hay overlap
-        if seg_end <= start_sec or seg_start >= end_sec:
-            continue
-
-        # Clamp al rango del clip
-        clipped_start = max(seg_start, start_sec) - start_sec
-        clipped_end = min(seg_end, end_sec) - start_sec
-
-        if clipped_end - clipped_start < 0.1:  # segmento demasiado corto
-            continue
-
-        result.append({
-            "start": round(clipped_start, 3),
-            "end": round(clipped_end, 3),
-            "text": seg["text"].strip(),
-        })
-
-    return result
-
-
-def build_drawtext_filters(
-    segments: list[dict],
-    cfg: Config,
-    frame_width: int,
-    frame_height: int,
-) -> list[str]:
-    """
-    Genera una lista de filtros drawtext, uno por segmento.
-    Cada filtro muestra el texto solo durante su ventana temporal.
-    """
-    filters = []
-    y_pos = frame_height - cfg.subtitle_margin_bottom
-
-    for seg in segments:
-        text = wrap_text(escape_drawtext(seg["text"]), cfg.max_chars_per_line)
-        t_start = seg["start"]
-        t_end = seg["end"]
-
-        # Sombra/outline: se logra con dos drawtext superpuestos (outline + fill)
-        # Primero el outline (negro), luego el texto encima (blanco)
-        base = (
-            f"drawtext="
-            f"text='{text}':"
-            f"fontsize={cfg.font_size}:"
-            f"fontcolor={cfg.font_color}:"
-            f"borderw={cfg.font_outline_width}:"
-            f"bordercolor={cfg.font_outline_color}:"
-            f"x=(w-text_w)/2:"
-            f"y={y_pos}-text_h:"
-            f"line_spacing=8:"
-            f"enable='between(t,{t_start},{t_end})'"
-        )
-        filters.append(base)
-
-    return filters
-
-
-def build_ffmpeg_cmd(
-    video_path: Path,
-    output_path: Path,
-    start_sec: float,
-    end_sec: float,
-    drawtext_filters: list[str],
-    cfg: Config,
-    src_width: int,
-    src_height: int,
-) -> list[str]:
-    """
-    Construye el comando ffmpeg completo para un clip.
-
-    Pipeline de filtros:
-      1. trim + setpts        → recorte temporal
-      2. crop                 → recorte vertical centrado (o con offset)
-      3. scale                → escala al tamaño de salida
-      4. drawtext (×N)        → subtítulos por segmento
-    """
-    duration = end_sec - start_sec
-
-    # ── Crop: recorte vertical centrado en el eje X ──
-    # Queremos un crop con aspect ratio 9:16 del video original.
-    # Tomamos toda la altura y ajustamos el ancho.
-    crop_h = src_height
-    crop_w = math.floor(src_height * 9 / 16)
-
-    # Si el video original es más angosto que el crop necesario, invertimos:
-    # tomamos todo el ancho y limitamos la altura.
-    if crop_w > src_width:
-        crop_w = src_width
-        crop_h = math.floor(src_width * 16 / 9)
-
-    # Centro horizontal con offset configurable
-    crop_x = max(0, (src_width - crop_w) // 2 + cfg.crop_offset_x)
-    crop_x = min(crop_x, src_width - crop_w)  # no salirse del borde
-    crop_y = (src_height - crop_h) // 2
-
-    # ── Filtro completo ──
-    filter_parts = [
-        f"trim=start={start_sec}:end={end_sec}",
-        "setpts=PTS-STARTPTS",
-        f"crop={crop_w}:{crop_h}:{crop_x}:{crop_y}",
-        f"scale={cfg.width}:{cfg.height}:flags=lanczos",
-    ] + drawtext_filters
-
-    filter_complex = ",".join(filter_parts)
-
-    # Audio: trim independiente
-    audio_filter = (
-        f"[0:a]atrim=start={start_sec}:end={end_sec},"
-        f"asetpts=PTS-STARTPTS[aout]"
+    header = (
+        "[Script Info]\n"
+        "ScriptType: v4.00+\n"
+        f"PlayResX: {cfg.width}\n"
+        f"PlayResY: {cfg.height}\n"
+        "ScaledBorderAndShadow: yes\n"
+        "WrapStyle: 0\n"
+        "\n"
+        "[V4+ Styles]\n"
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, "
+        "OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, "
+        "ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
+        "Alignment, MarginL, MarginR, MarginV, Encoding\n"
+        f"Style: Default,Arial,{cfg.font_size},"
+        f"{col_white},&H000000FF,{col_black},{col_shadow},"
+        f"-1,0,0,0,100,100,0,0,1,4,2,2,60,60,{margin_v},1\n"
+        "\n"
+        "[Events]\n"
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
     )
 
-    cmd = [
-        "ffmpeg",
-        "-y",                           # sobreescribir sin preguntar
-        "-i", str(video_path),
-        "-filter_complex",
-        f"[0:v]{filter_complex}[vout];{audio_filter}",
-        "-map", "[vout]",
-        "-map", "[aout]",
-        "-c:v", "libx264",
-        "-preset", "fast",
-        "-crf", "22",                   # calidad visual alta
-        "-c:a", "aac",
-        "-b:a", "192k",
-        "-movflags", "+faststart",      # streaming-friendly
-        "-t", str(duration),
+    lines = [header]
+    for seg in segments:
+        t_start = seconds_to_ass(seg["start"])
+        t_end   = seconds_to_ass(seg["end"])
+        text    = wrap_for_ass(seg["text"], cfg.max_chars_per_line)
+        if text:
+            text = text[0].upper() + text[1:]
+        lines.append(f"Dialogue: 0,{t_start},{t_end},Default,,0,0,0,,{text}")
+
+    with open(output_path, "w", encoding="utf-8-sig") as f:
+        f.write("\n".join(lines))
+        f.write("\n")
+
+
+# ──────────────────────────────────────────────
+# FFMPEG COMMAND BUILDER
+# ──────────────────────────────────────────────
+
+def build_ffmpeg_cmd(
+    video_path:   Path,
+    output_path:  Path,
+    ass_path:     Path,
+    start_sec:    float,
+    end_sec:      float,
+    crop_filter:  str,
+    cfg:          Config,
+) -> list[str]:
+    duration  = end_sec - start_sec
+    ass_str   = str(ass_path.resolve())
+
+    vf = (
+        f"trim=start={start_sec}:end={end_sec},"
+        f"setpts=PTS-STARTPTS,"
+        f"{crop_filter},"
+        f"scale={cfg.width}:{cfg.height}:flags=lanczos,"
+        f"subtitles='{ass_str}'"
+    )
+    af = f"atrim=start={start_sec}:end={end_sec},asetpts=PTS-STARTPTS"
+
+    return [
+        "ffmpeg", "-y",
+        "-i",        str(video_path),
+        "-vf",       vf,
+        "-af",       af,
+        "-c:v",      "libx264",
+        "-preset",   "fast",
+        "-crf",      "22",
+        "-c:a",      "aac",
+        "-b:a",      "192k",
+        "-movflags", "+faststart",
+        "-t",        str(duration),
         str(output_path),
     ]
 
-    return cmd
-
 
 def run_ffmpeg(cmd: list[str], label: str) -> bool:
-    """Ejecuta ffmpeg, loguea stderr en caso de error. Retorna True si OK."""
     log.info("Procesando: %s", label)
     log.debug("CMD: %s", " ".join(cmd))
-
-    result = subprocess.run(cmd, capture_output=True, text=True)
-
-    if result.returncode != 0:
-        log.error("ffmpeg falló para '%s':\n%s", label, result.stderr[-2000:])
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        log.error("ffmpeg falló para '%s':\n%s", label, r.stderr[-3000:])
         return False
-
-    log.info("✓ Generado: %s", label)
+    log.info("✓ OK: %s", label)
     return True
 
 
 def concat_clips(clip_paths: list[Path], output_path: Path) -> bool:
-    """
-    Concatena una lista de clips usando el demuxer concat de ffmpeg.
-    Más rápido que re-encodear si todos tienen el mismo codec/resolución.
-    """
-    if not clip_paths:
-        return False
-
     with tempfile.NamedTemporaryFile(
         mode="w", suffix=".txt", delete=False, encoding="utf-8"
     ) as f:
@@ -348,62 +569,55 @@ def concat_clips(clip_paths: list[Path], output_path: Path) -> bool:
             f.write(f"file '{p.resolve()}'\n")
 
     cmd = [
-        "ffmpeg",
-        "-y",
-        "-f", "concat",
-        "-safe", "0",
+        "ffmpeg", "-y",
+        "-f", "concat", "-safe", "0",
         "-i", concat_file,
-        "-c", "copy",               # copy stream, sin re-encode
+        "-c", "copy",
         "-movflags", "+faststart",
         str(output_path),
     ]
 
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    r = subprocess.run(cmd, capture_output=True, text=True)
     os.unlink(concat_file)
 
-    if result.returncode != 0:
-        log.error("Concat falló:\n%s", result.stderr[-2000:])
+    if r.returncode != 0:
+        log.error("Concat falló:\n%s", r.stderr[-2000:])
         return False
 
-    log.info("✓ Compilado generado: %s", output_path)
+    log.info("✓ Compilado: %s", output_path)
     return True
 
 
 # ──────────────────────────────────────────────
-# MAIN
+# ARG PARSER
 # ──────────────────────────────────────────────
 
 def parse_args() -> Config:
-    parser = argparse.ArgumentParser(
-        description="Genera clips 9:16 con subtítulos desde key_moments de prédica."
+    p = argparse.ArgumentParser(
+        description="Genera clips 9:16 con face tracking y subtítulos ASS."
     )
-    parser.add_argument("--predica",   required=True, help="JSON procesado por IA")
-    parser.add_argument("--whisper",   required=True, help="JSON de transcripción Whisper")
-    parser.add_argument("--video",     required=True, help="Video original (.mp4)")
-    parser.add_argument("--output",    default="./output", help="Directorio de salida")
-    parser.add_argument(
-        "--resolution", default="1080x1920",
-        help="Resolución de salida WxH (default: 1080x1920)"
-    )
-    parser.add_argument(
-        "--crop-offset", type=int, default=0,
-        help="Offset X del crop en px sobre el video original (+ derecha, - izquierda)"
-    )
-    parser.add_argument(
-        "--no-concat", action="store_true",
-        help="No generar video compilado con todos los clips"
-    )
-    parser.add_argument(
-        "--font-size", type=int, default=60,
-        help="Tamaño de fuente para subtítulos (default: 60)"
-    )
-    parser.add_argument(
-        "--subtitle-margin", type=int, default=200,
-        help="Margen inferior de subtítulos en px (default: 200)"
-    )
-    parser.add_argument("--debug", action="store_true", help="Logging verboso")
+    p.add_argument("--predica",   required=True)
+    p.add_argument("--whisper",   required=True,
+                   help="Archivo .json o directorio de transcripción Whisper")
+    p.add_argument("--video",     required=True)
+    p.add_argument("--output",    default="./output")
+    p.add_argument("--resolution", default="1080x1920")
+    p.add_argument("--no-concat", action="store_true")
+    p.add_argument("--font-size", type=int,   default=72)
+    p.add_argument("--subtitle-y", type=float, default=0.72)
+    p.add_argument("--max-chars",  type=int,   default=28)
+    # Tracking
+    p.add_argument("--no-tracking", action="store_true",
+                   help="Deshabilitar face tracking (usar crop centrado)")
+    p.add_argument("--crop-map", default=None,
+                   help="Ruta custom al crop_map.json (omitir = auto)")
+    p.add_argument("--tracker-sample-rate",   type=int, default=1,
+                   help="FPS de análisis del tracker (default: 1)")
+    p.add_argument("--tracker-smooth-window", type=int, default=3,
+                   help="Segundos de suavizado del tracker (default: 3)")
+    p.add_argument("--debug", action="store_true")
 
-    args = parser.parse_args()
+    args = p.parse_args()
 
     if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
@@ -411,117 +625,134 @@ def parse_args() -> Config:
     w, h = args.resolution.split("x")
 
     return Config(
-        predica_json=Path(args.predica),
-        whisper_json=Path(args.whisper),
-        video_path=Path(args.video),
-        output_dir=Path(args.output),
-        width=int(w),
-        height=int(h),
-        crop_offset_x=args.crop_offset,
-        concat=not args.no_concat,
-        font_size=args.font_size,
-        subtitle_margin_bottom=args.subtitle_margin,
+        predica_json           = Path(args.predica),
+        whisper_path           = Path(args.whisper),
+        video_path             = Path(args.video),
+        output_dir             = Path(args.output),
+        width                  = int(w),
+        height                 = int(h),
+        concat                 = not args.no_concat,
+        font_size              = args.font_size,
+        subtitle_y_pct         = args.subtitle_y,
+        max_chars_per_line     = args.max_chars,
+        use_tracking           = not args.no_tracking,
+        crop_map_path          = Path(args.crop_map) if args.crop_map else None,
+        tracker_sample_rate    = args.tracker_sample_rate,
+        tracker_smooth_window  = args.tracker_smooth_window,
     )
 
+
+# ──────────────────────────────────────────────
+# MAIN
+# ──────────────────────────────────────────────
 
 def main() -> None:
     cfg = parse_args()
 
-    # ── Validaciones ──
     check_ffmpeg()
 
-    for p, label in [
-        (cfg.predica_json, "--predica"),
-        (cfg.whisper_json, "--whisper"),
-        (cfg.video_path,   "--video"),
-    ]:
-        if not p.exists():
-            log.error("Archivo no encontrado (%s): %s", label, p)
+    for path, label in [(cfg.predica_json, "--predica"), (cfg.video_path, "--video")]:
+        if not path.exists():
+            log.error("No encontrado (%s): %s", label, path)
             sys.exit(1)
 
+    whisper_file = resolve_whisper_path(cfg.whisper_path, cfg.predica_json)
+
     cfg.output_dir.mkdir(parents=True, exist_ok=True)
+    ass_dir = cfg.output_dir / "_ass_tmp"
+    ass_dir.mkdir(exist_ok=True)
 
     # ── Cargar datos ──
-    predica = load_predica_json(cfg.predica_json)
-    segments = load_whisper_json(cfg.whisper_json)
-    key_moments = predica.get("key_moments", [])
+    predica      = load_predica_json(cfg.predica_json)
+    all_segments = load_whisper_segments(whisper_file)
+    key_moments  = predica.get("key_moments", [])
 
     if not key_moments:
-        log.error("No se encontraron key_moments en el JSON de prédica.")
+        log.error("No se encontraron key_moments.")
         sys.exit(1)
 
-    log.info("Video: %s", cfg.video_path)
-    log.info("Key moments encontrados: %d", len(key_moments))
-
-    # ── Dimensiones del video fuente ──
     src_w, src_h = get_video_dimensions(cfg.video_path)
-    log.info("Resolución fuente: %dx%d", src_w, src_h)
 
-    # ── Procesar cada key_moment ──
+    # ── Face tracking ──
+    crop_map = load_or_generate_crop_map(cfg)
+
+    if crop_map:
+        log.info("Face tracking: ACTIVO (crop dinámico)")
+        fps = get_video_fps(cfg.video_path)
+    else:
+        log.info("Face tracking: INACTIVO (crop centrado fijo)")
+        fps = None
+
+    log.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    log.info("Video:       %s  (%dx%d)", cfg.video_path.name, src_w, src_h)
+    log.info("Salida:      %dx%d", cfg.width, cfg.height)
+    log.info("Key moments: %d", len(key_moments))
+    log.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+
     generated_clips: list[Path] = []
 
     for km in key_moments:
-        km_id    = km["id"]
-        title    = km["title"]
-        start    = float(km["start_seconds"])
-        end      = float(km["end_seconds"])
+        km_id  = km["id"]
+        title  = km["title"]
+        start  = float(km["start_seconds"])
+        end    = float(km["end_seconds"])
 
-        # Nombre de archivo seguro
-        safe_title = "".join(
-            c if c.isalnum() or c in (" ", "-", "_") else "_"
-            for c in title
-        ).strip().replace(" ", "_")[:50]
-
-        clip_filename = f"{km_id:02d}_{safe_title}.mp4"
-        clip_path = cfg.output_dir / clip_filename
+        safe_title = re.sub(r"[^\w\s\-]", "_", title).strip().replace(" ", "_")[:50]
+        clip_path  = cfg.output_dir / f"{km_id:02d}_{safe_title}.mp4"
+        ass_path   = ass_dir        / f"{km_id:02d}_{safe_title}.ass"
 
         log.info(
-            "── Key moment %d/%d: '%s' [%.1fs → %.1fs]",
+            "── [%d/%d] %s  [%.0fs → %.0fs]",
             km_id, len(key_moments), title, start, end
         )
 
-        # Segmentos de Whisper para este rango
-        clip_segments = segments_for_range(segments, start, end)
-        log.info("   Segmentos de subtítulos: %d", len(clip_segments))
+        # Subtítulos
+        clip_segs = segments_for_range(all_segments, start, end)
+        log.info("   Segmentos Whisper: %d", len(clip_segs))
+        generate_ass(clip_segs, ass_path, cfg)
 
-        if not clip_segments:
-            log.warning("   Sin segmentos Whisper para este rango, se genera sin subtítulos.")
+        # Crop filter
+        if crop_map:
+            crop_filter = build_dynamic_crop_filter(
+                crop_map, start, end, src_w, src_h, fps
+            )
+            log.debug("   Crop dinámico generado")
+        else:
+            crop_filter = build_static_crop_filter(src_w, src_h)
+            log.debug("   Crop estático centrado")
 
-        # Filtros drawtext
-        drawtext = build_drawtext_filters(
-            clip_segments, cfg, cfg.width, cfg.height
-        )
-
-        # Comando ffmpeg
         cmd = build_ffmpeg_cmd(
-            video_path=cfg.video_path,
-            output_path=clip_path,
-            start_sec=start,
-            end_sec=end,
-            drawtext_filters=drawtext,
-            cfg=cfg,
-            src_width=src_w,
-            src_height=src_h,
+            video_path  = cfg.video_path,
+            output_path = clip_path,
+            ass_path    = ass_path,
+            start_sec   = start,
+            end_sec     = end,
+            crop_filter = crop_filter,
+            cfg         = cfg,
         )
 
-        ok = run_ffmpeg(cmd, f"clip_{km_id:02d}_{safe_title}")
-
-        if ok:
+        if run_ffmpeg(cmd, f"{km_id:02d}_{safe_title}"):
             generated_clips.append(clip_path)
         else:
-            log.warning("   Clip %d omitido del compilado por error.", km_id)
+            log.warning("   ✗ Clip %d omitido.", km_id)
 
-    # ── Compilado ──
+    # Limpiar ASS temporales
+    for f in ass_dir.glob("*.ass"):
+        f.unlink()
+    try:
+        ass_dir.rmdir()
+    except OSError:
+        pass
+
     if cfg.concat and len(generated_clips) > 1:
         concat_path = cfg.output_dir / "00_compilado_completo.mp4"
-        log.info("Generando compilado con %d clips...", len(generated_clips))
+        log.info("Compilado (%d clips)...", len(generated_clips))
         concat_clips(generated_clips, concat_path)
 
-    # ── Resumen ──
-    log.info("══════════════════════════════")
+    log.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     log.info("Clips generados: %d / %d", len(generated_clips), len(key_moments))
-    log.info("Directorio de salida: %s", cfg.output_dir.resolve())
-    log.info("══════════════════════════════")
+    log.info("Salida: %s", cfg.output_dir.resolve())
+    log.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
 
 if __name__ == "__main__":
