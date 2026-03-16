@@ -157,7 +157,75 @@ def center_to_crop_x(center_x: int, crop_w: int, src_w: int) -> int:
 # SUAVIZADO
 # ──────────────────────────────────────────────
 
-def smooth_crop_positions(entries: list[dict], window_sec: int) -> list[dict]:
+# ──────────────────────────────────────────────
+# SUAVIZADO
+# ──────────────────────────────────────────────
+
+def fill_gaps(entries: list[dict]) -> list[int]:
+    """
+    Rellena entradas sin detección por interpolación lineal entre vecinos detectados.
+    Retorna lista de crop_x completa (sin huecos).
+    """
+    n      = len(entries)
+    filled = [e["crop_x"] for e in entries]
+
+    for i in range(n):
+        if not entries[i]["face_detected"]:
+            prev = next((j for j in range(i - 1, -1, -1) if entries[j]["face_detected"]), None)
+            nxt  = next((j for j in range(i + 1, n)      if entries[j]["face_detected"]), None)
+            if prev is not None and nxt is not None:
+                t         = (i - prev) / (nxt - prev)
+                filled[i] = int(filled[prev] + t * (filled[nxt] - filled[prev]))
+            elif prev is not None:
+                filled[i] = filled[prev]
+            elif nxt is not None:
+                filled[i] = filled[nxt]
+
+    return filled
+
+
+def smooth_ema(values: list[int], alpha: float) -> list[int]:
+    """
+    Exponential Moving Average bidireccional (forward + backward promediados).
+
+    Por qué EMA en lugar de ventana deslizante:
+      - Ventana deslizante centrada introduce lag = window/2 segundos
+      - EMA forward-only sigue bien pero puede oscilar con detecciones ruidosas
+      - EMA bidireccional: promedio de forward pass y backward pass
+        → sin lag perceptible, sin ruido, sin overshooting
+
+    alpha: factor de suavizado
+      0.1 = muy suave, lento para seguir movimientos bruscos
+      0.3 = balance óptimo para cámara fija con orador en movimiento
+      0.6 = más responsivo, puede verse algo nervioso
+      1.0 = sin suavizado (raw)
+    """
+    n = len(values)
+    if n == 0:
+        return values
+
+    # Forward pass
+    fwd = [0.0] * n
+    fwd[0] = values[0]
+    for i in range(1, n):
+        fwd[i] = alpha * values[i] + (1 - alpha) * fwd[i - 1]
+
+    # Backward pass
+    bwd = [0.0] * n
+    bwd[-1] = values[-1]
+    for i in range(n - 2, -1, -1):
+        bwd[i] = alpha * values[i] + (1 - alpha) * bwd[i + 1]
+
+    # Promedio bidireccional
+    return [int((fwd[i] + bwd[i]) / 2) for i in range(n)]
+
+
+def smooth_crop_positions(entries: list[dict], alpha: float) -> list[dict]:
+    """
+    Suaviza posiciones de crop:
+      1. Rellena gaps (sin detección) por interpolación lineal
+      2. Aplica EMA bidireccional con factor alpha
+    """
     n = len(entries)
     if n == 0:
         return entries
@@ -167,27 +235,8 @@ def smooth_crop_positions(entries: list[dict], window_sec: int) -> list[dict]:
         log.warning("Ningún rostro detectado — usando crop centrado fijo.")
         return entries
 
-    # Paso 1: rellenar gaps por interpolación lineal entre detecciones
-    filled = [e["crop_x"] for e in entries]
-    for i in range(n):
-        if not entries[i]["face_detected"]:
-            prev = next((j for j in range(i - 1, -1, -1) if entries[j]["face_detected"]), None)
-            nxt  = next((j for j in range(i + 1, n)      if entries[j]["face_detected"]), None)
-            if prev is not None and nxt is not None:
-                t          = (i - prev) / (nxt - prev)
-                filled[i]  = int(filled[prev] + t * (filled[nxt] - filled[prev]))
-            elif prev is not None:
-                filled[i] = filled[prev]
-            elif nxt is not None:
-                filled[i] = filled[nxt]
-
-    # Paso 2: ventana deslizante centrada
-    half     = max(1, window_sec // 2)
-    smoothed = [
-        int(sum(filled[max(0, i - half): min(n, i + half + 1)]) /
-            len(filled[max(0, i - half): min(n, i + half + 1)]))
-        for i in range(n)
-    ]
+    filled   = fill_gaps(entries)
+    smoothed = smooth_ema(filled, alpha)
 
     return [
         {
@@ -206,7 +255,7 @@ def smooth_crop_positions(entries: list[dict], window_sec: int) -> list[dict]:
 def analyze_video(
     video_path:    Path,
     sample_rate:   int,
-    smooth_window: int,
+    ema_alpha:     float,
     confidence:    float,
 ) -> dict:
 
@@ -301,8 +350,8 @@ def analyze_video(
             detection_rate
         )
 
-    log.info("Suavizando (ventana %ds)...", smooth_window)
-    smoothed = smooth_crop_positions(entries, smooth_window)
+    log.info("Aplicando EMA bidireccional (alpha=%.2f)...", ema_alpha)
+    smoothed = smooth_crop_positions(entries, ema_alpha)
 
     return {
         "video":               video_path.name,
@@ -310,7 +359,7 @@ def analyze_video(
         "src_height":          src_h,
         "crop_width":          crop_w,
         "sample_rate":         sample_rate,
-        "smooth_window":       smooth_window,
+        "ema_alpha":           ema_alpha,
         "duration":            round(dur, 3),
         "detection_rate_pct":  round(detection_rate, 1),
         "entries":             smoothed,
@@ -359,9 +408,13 @@ def parse_args():
     p.add_argument("--video",          required=True)
     p.add_argument("--output",         required=True)
     p.add_argument("--sample-rate",    type=int,   default=1)
-    p.add_argument("--smooth-window",  type=int,   default=3)
-    p.add_argument("--confidence",     type=float, default=0.4,
-                   help="Confianza mínima de detección 0.0-1.0 (default: 0.4)")
+    p.add_argument("--ema-alpha",      type=float, default=0.3,
+                   help=(
+                       "Factor de suavizado EMA 0.0-1.0 (default: 0.3). "
+                       "Menor = más suave pero más lento. "
+                       "0.1=muy suave  0.3=balance  0.6=responsivo  1.0=sin suavizado"
+                   ))
+    p.add_argument("--confidence",     type=float, default=0.4)
     p.add_argument("--debug",          action="store_true")
     return p.parse_args()
 
@@ -393,17 +446,17 @@ def main():
 
     log.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     log.info("Face tracker  (MediaPipe >= 0.10)")
-    log.info("Video:         %s", video_path)
-    log.info("Sample rate:   %d fps", args.sample_rate)
-    log.info("Smooth window: %ds", args.smooth_window)
-    log.info("Confidence:    %.1f", args.confidence)
+    log.info("Video:        %s", video_path)
+    log.info("Sample rate:  %d fps", args.sample_rate)
+    log.info("EMA alpha:    %.2f", args.ema_alpha)
+    log.info("Confidence:   %.1f", args.confidence)
     log.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
     crop_map = analyze_video(
-        video_path    = video_path,
-        sample_rate   = args.sample_rate,
-        smooth_window = args.smooth_window,
-        confidence    = args.confidence,
+        video_path  = video_path,
+        sample_rate = args.sample_rate,
+        ema_alpha   = args.ema_alpha,
+        confidence  = args.confidence,
     )
 
     with open(output_path, "w", encoding="utf-8") as f:
@@ -411,8 +464,8 @@ def main():
 
     log.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     log.info("Guardado: %s", output_path)
-    log.info("Entradas: %d | Detección: %.1f%%",
-             len(crop_map["entries"]), crop_map["detection_rate_pct"])
+    log.info("Entradas: %d | Detección: %.1f%% | EMA alpha: %.2f",
+             len(crop_map["entries"]), crop_map["detection_rate_pct"], crop_map["ema_alpha"])
     log.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
 
