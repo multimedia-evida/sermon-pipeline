@@ -81,7 +81,7 @@ class Config:
     use_tracking:           bool  = True
     crop_map_path:          Path  = None
     tracker_sample_rate:    int   = 1
-    tracker_smooth_window:  int   = 3
+    tracker_ema_alpha:      float = 0.3    # EMA alpha para face_tracker.py
     sendcmd_interval:       float = 2.0    # segundos entre keyframes (más alto = más suave)
 
 
@@ -275,12 +275,12 @@ def load_or_generate_crop_map(cfg: Config) -> dict | None:
         return None
 
     cmd = [
-        sys.executable,           # mismo intérprete Python del venv
+        sys.executable,
         str(tracker_script),
-        "--video",   str(cfg.video_path),
-        "--output",  str(crop_map_path),
-        "--sample-rate",   str(cfg.tracker_sample_rate),
-        "--smooth-window", str(cfg.tracker_smooth_window),
+        "--video",       str(cfg.video_path),
+        "--output",      str(crop_map_path),
+        "--sample-rate", str(cfg.tracker_sample_rate),
+        "--ema-alpha",   str(cfg.tracker_ema_alpha),
     ]
 
     log.info("CMD: %s", " ".join(cmd))
@@ -661,7 +661,8 @@ def parse_args() -> Config:
     p.add_argument("--crop-map", default=None,
                    help="Ruta custom al crop_map.json (omitir = auto)")
     p.add_argument("--tracker-sample-rate",   type=int,   default=1)
-    p.add_argument("--tracker-smooth-window", type=int,   default=3)
+    p.add_argument("--tracker-ema-alpha",     type=float, default=0.3,
+                   help="EMA alpha del face tracker (default: 0.3). Menor=más suave.")
     p.add_argument("--sendcmd-interval",      type=float, default=2.0,
                    help="Segundos entre keyframes de crop (default: 2.0 → movimiento suave)")
     p.add_argument("--debug", action="store_true")
@@ -688,7 +689,7 @@ def parse_args() -> Config:
         use_tracking           = not args.no_tracking,
         crop_map_path          = Path(args.crop_map) if args.crop_map else None,
         tracker_sample_rate    = args.tracker_sample_rate,
-        tracker_smooth_window  = args.tracker_smooth_window,
+        tracker_ema_alpha      = args.tracker_ema_alpha,
         sendcmd_interval       = args.sendcmd_interval,
     )
 
