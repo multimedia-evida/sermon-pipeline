@@ -15,6 +15,18 @@
 #   local           → Pipeline desde archivo local (NAS): transcribe → webhook
 #                     El video original se mueve a processed/ dentro del NAS al terminar
 #
+# Opciones globales:
+#
+#   --webhook       → Selecciona el webhook a usar (requerido en modos que llaman al webhook)
+#                     predicas      → WEBHOOK_URL_PREDICAS       (producción prédicas)
+#                     predicas-test → WEBHOOK_URL_PREDICAS_TEST  (pruebas prédicas)
+#                     gc            → WEBHOOK_URL_GC             (producción GC)
+#                     gc-test       → WEBHOOK_URL_GC_TEST        (pruebas GC)
+#
+#   --word-timestamps → Incluye timestamps por palabra en el transcript
+#                       Útil para subtítulos dinámicos y análisis de contenido
+#                       Sin este flag solo se generan timestamps por segmento
+#
 # Ejemplos:
 #
 #   python ythelper.py --mode download-audio --ids abc123 def456
@@ -22,18 +34,18 @@
 #   python ythelper.py --mode download-video --ids abc123
 #   python ythelper.py --mode download-all   --ids abc123
 #   python ythelper.py --mode transcribe
-#   python ythelper.py --mode webhook
-#   python ythelper.py --mode webhook --file /ruta/al/transcript.json
-#   python ythelper.py --mode webhook --file t1.json t2.json
-#   python ythelper.py --mode run-audio --ids abc123
-#   python ythelper.py --mode run-full  --ids-file ids.txt
-#   python ythelper.py --mode local --file /mnt/nas/sermones/video.mp4
-#   python ythelper.py --mode local --local-folder /mnt/nas/sermones/
+#   python ythelper.py --mode transcribe --word-timestamps
+#   python ythelper.py --mode webhook --webhook predicas
+#   python ythelper.py --mode webhook --webhook predicas-test --file transcript.json
+#   python ythelper.py --mode run-audio --ids abc123 --webhook predicas
+#   python ythelper.py --mode run-full  --ids-file ids.txt --webhook gc
+#   python ythelper.py --mode run-full  --ids-file ids.txt --webhook gc --word-timestamps
+#   python ythelper.py --mode local --file /mnt/nas/sermones/video.mp4 --webhook predicas
+#   python ythelper.py --mode local --local-folder /mnt/nas/sermones/ --webhook gc-test
 #
 # Modo resume (reintenta los IDs que fallaron o quedaron pendientes):
 #
-#   python ythelper.py --mode run-full --resume
-#   python ythelper.py --mode run-audio --resume
+#   python ythelper.py --mode run-full --resume --webhook predicas
 #
 #   --resume lee logs/progress.json y saltea los IDs con status DONE.
 #   No requiere --ids ni --ids-file (los toma del progress.json).
@@ -50,10 +62,12 @@
 #       1kwue3QCOyo
 #
 # Variables de entorno requeridas en .env:
-#   WEBHOOK_URL      → URL del webhook destino (producción)
-#   WEBHOOK_URL_TEST → URL del webhook destino (pruebas, usar con --test)
-#   WEBHOOK_SECRET   → Header de autenticación (X-Webhook-Secret)
-#   YT_COOKIES_PATH  → Ruta al archivo de cookies de YouTube
+#   WEBHOOK_URL_PREDICAS      → Webhook prédicas (producción)
+#   WEBHOOK_URL_PREDICAS_TEST → Webhook prédicas (pruebas)
+#   WEBHOOK_URL_GC            → Webhook GC (producción)
+#   WEBHOOK_URL_GC_TEST       → Webhook GC (pruebas)
+#   WEBHOOK_SECRET            → Header de autenticación (X-Webhook-Secret)
+#   YT_COOKIES_PATH           → Ruta al archivo de cookies de YouTube
 #
 # Estructura de carpetas:
 #   data/input/source/           → Audios WAV listos para transcribir
@@ -74,9 +88,11 @@
 # ==========================
 
 import os
+import gc
 import json
 import shutil
 import subprocess
+import tempfile
 import requests
 import argparse
 import time
@@ -99,13 +115,30 @@ TRANSCRIPTS_DONE = "data/output/transcripts/done"
 LOGS_DIR         = "data/logs"
 PROGRESS_FILE    = os.path.join(LOGS_DIR, "progress.json")
 
-WEBHOOK_URL      = os.getenv("WEBHOOK_URL")
-WEBHOOK_URL_TEST = os.getenv("WEBHOOK_URL_TEST")
+WEBHOOK_URLS = {
+    "predicas":      os.getenv("WEBHOOK_URL_PREDICAS"),
+    "predicas-test": os.getenv("WEBHOOK_URL_PREDICAS_TEST"),
+    "gc":            os.getenv("WEBHOOK_URL_GC"),
+    "gc-test":       os.getenv("WEBHOOK_URL_GC_TEST"),
+}
 WEBHOOK_SECRET   = os.getenv("WEBHOOK_SECRET")
 COOKIES_PATH     = os.getenv("YT_COOKIES_PATH")
-MODEL_SIZE       = "small"
+MODEL_SIZE       = "tiny"
 
-# Se sobreescribe en main() según --test
+# Configuración de memoria para Whisper
+# beam_size=1 (greedy) usa ~50% menos RAM que beam_size=5
+# vad_filter=True saltea silencios y reduce audio efectivo procesado
+WHISPER_BEAM_SIZE    = 1
+WHISPER_VAD_FILTER   = True
+WHISPER_CPU_THREADS  = 2
+WHISPER_COMPUTE_TYPE = "int8"
+
+# Frecuencia de muestreo objetivo para pre-conversión de audio
+# 16kHz mono es lo que Whisper necesita internamente; convertir antes
+# evita que ffmpeg decodifique todo el WAV original en RAM.
+AUDIO_RESAMPLE_HZ    = 16000
+
+# Se sobreescribe en main() según --webhook
 ACTIVE_WEBHOOK_URL = None
 
 FILENAME_TEMPLATE  = "%(upload_date)s_%(id)s_%(title)s.%(ext)s"
@@ -250,6 +283,69 @@ def print_summary(progress):
 
 
 # ==========================
+# PRE-CONVERSIÓN DE AUDIO
+# ==========================
+
+def get_file_size_mb(filepath):
+    """Retorna el tamaño del archivo en MB."""
+    try:
+        return os.path.getsize(filepath) / (1024 * 1024)
+    except OSError:
+        return 0
+
+
+def convert_audio_for_whisper(src_path, tmp_dir):
+    """
+    Convierte el audio fuente a WAV mono 16kHz usando ffmpeg.
+    Esto reduce drásticamente el uso de RAM: un WAV de 4GB a
+    16kHz mono ocupa ~300MB. Retorna la ruta del archivo temporal,
+    o None si ffmpeg falla.
+
+    El archivo temporal se crea en tmp_dir y debe eliminarse
+    manualmente después de transcribir.
+    """
+    src_size_mb = get_file_size_mb(src_path)
+    log.info(f"   📦 Archivo fuente: {src_size_mb:.0f} MB → pre-convirtiendo a 16kHz mono...")
+
+    # Nombre único para evitar colisiones entre archivos paralelos
+    base = os.path.splitext(os.path.basename(src_path))[0]
+    tmp_path = os.path.join(tmp_dir, f"{base}_16k.wav")
+
+    cmd = [
+        "ffmpeg",
+        "-y",                        # sobreescribir si existe
+        "-i", src_path,
+        "-ar", str(AUDIO_RESAMPLE_HZ),  # 16000 Hz
+        "-ac", "1",                  # mono
+        "-c:a", "pcm_s16le",         # PCM 16-bit (lo que espera Whisper)
+        "-vn",                       # ignorar pista de video si hay
+        tmp_path
+    ]
+
+    try:
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+        if result.returncode != 0:
+            err = result.stderr.decode(errors="replace")[-500:]
+            log.error(f"   ❌ ffmpeg falló (código {result.returncode}): {err}")
+            return None
+
+        tmp_size_mb = get_file_size_mb(tmp_path)
+        log.info(f"   ✅ Pre-conversión OK: {tmp_size_mb:.0f} MB ({tmp_size_mb/src_size_mb*100:.0f}% del original)")
+        return tmp_path
+
+    except FileNotFoundError:
+        log.error("   ❌ ffmpeg no encontrado. Instalá ffmpeg o agregalo al PATH.")
+        return None
+    except Exception as e:
+        log.error(f"   ❌ Error en pre-conversión: {e}")
+        return None
+
+
+# ==========================
 # DESCARGA
 # ==========================
 
@@ -383,7 +479,7 @@ def get_failed_downloads(progress, ids):
     ]
 
 
-def auto_retry_downloads(ids, progress, include_video=False):
+def auto_retry_downloads(ids, progress, include_video=False, word_timestamps=False):
     """
     Reintenta la descarga de audio (y video si include_video=True)
     para los IDs fallidos del batch.
@@ -441,8 +537,9 @@ def auto_retry_downloads(ids, progress, include_video=False):
                 if audio_file:
                     from faster_whisper import WhisperModel
                     log.info(f"🚀 Cargando modelo Whisper para reintento...")
-                    model = WhisperModel(MODEL_SIZE, compute_type="int8", cpu_threads=4)
-                    json_path = process_whisper_file(audio_file, model, progress, i, len(failed))
+                    model = WhisperModel(MODEL_SIZE, compute_type=WHISPER_COMPUTE_TYPE, cpu_threads=WHISPER_CPU_THREADS)
+                    json_path = process_whisper_file(audio_file, model, progress, i, len(failed), word_timestamps=word_timestamps)
+                    _unload_model(model)
                     if json_path:
                         send_webhook(json_path, progress)
             else:
@@ -464,6 +561,20 @@ def auto_retry_downloads(ids, progress, include_video=False):
 # TRANSCRIPCIÓN (WHISPER)
 # ==========================
 
+def _unload_model(model):
+    """
+    Libera el modelo Whisper de memoria explícitamente.
+    faster-whisper usa ctranslate2 que no libera la RAM del modelo
+    hasta que el objeto es destruido y el GC lo recolecta.
+    """
+    try:
+        del model
+    except Exception:
+        pass
+    gc.collect()
+    log.info("   🧹 Memoria del modelo liberada")
+
+
 def get_clean_video_id(filename):
     """Extrae el ID de 11 caracteres después del primer guion bajo."""
     base_name = os.path.splitext(filename)[0]
@@ -473,7 +584,20 @@ def get_clean_video_id(filename):
     return base_name
 
 
-def process_whisper_file(filename, model, progress, index, total):
+def process_whisper_file(filename, model, progress, index, total, word_timestamps=False):
+    """
+    Transcribe un archivo de audio.
+
+    Flujo de memoria:
+      1. Pre-convierte el audio a WAV 16kHz mono con ffmpeg en un
+         directorio temporal (reduce el input de 4GB a ~300MB).
+      2. Pasa el archivo convertido a faster-whisper con parámetros
+         conservadores (beam_size=1, vad_filter=True).
+      3. Elimina el archivo temporal al terminar (éxito o error).
+
+    Esto evita que ffmpeg dentro de faster-whisper tenga que decodificar
+    un WAV de alta calidad / alta tasa de muestreo en RAM.
+    """
     base_name = os.path.splitext(filename)[0]
     video_id  = get_clean_video_id(filename)
     filepath  = os.path.join(SOURCE, filename)
@@ -482,8 +606,29 @@ def process_whisper_file(filename, model, progress, index, total):
     log.info(f"🎧 [{index}/{total}] Transcribiendo → {filename} (ID: {video_id})")
     update_progress(progress, video_id, "IN_PROGRESS", step="transcribe")
 
+    tmp_dir      = None
+    tmp_audio    = None
+
     try:
-        segments, info = model.transcribe(filepath, language="es")
+        # ── Pre-conversión a 16kHz mono ──────────────────────
+        tmp_dir   = tempfile.mkdtemp(prefix="ythelper_")
+        tmp_audio = convert_audio_for_whisper(filepath, tmp_dir)
+
+        if tmp_audio is None:
+            # ffmpeg falló: intentar transcribir el original (puede OOM)
+            log.warning("   ⚠️  Usando archivo original (sin pre-conversión)")
+            audio_to_transcribe = filepath
+        else:
+            audio_to_transcribe = tmp_audio
+
+        # ── Transcripción ────────────────────────────────────
+        segments, info = model.transcribe(
+            audio_to_transcribe,
+            language="es",
+            beam_size=WHISPER_BEAM_SIZE,
+            vad_filter=WHISPER_VAD_FILTER,
+            word_timestamps=word_timestamps,
+        )
 
         result = {
             "videoId":  video_id,
@@ -497,13 +642,20 @@ def process_whisper_file(filename, model, progress, index, total):
             sys.stdout.write(f"\r   ⏳ Progreso: {percent:.2f}% | {segment.end:.1f}/{info.duration:.1f} seg")
             sys.stdout.flush()
 
-            result["segments"].append({
+            seg_entry = {
                 "start": segment.start,
                 "end":   segment.end,
-                "text":  segment.text.strip()
-            })
+                "text":  segment.text.strip(),
+            }
+            if word_timestamps:
+                seg_entry["words"] = [
+                    {"word": w.word.strip(), "start": w.start, "end": w.end}
+                    for w in (segment.words or [])
+                ]
+            result["segments"].append(seg_entry)
 
         print()  # salto de línea tras la barra de progreso
+
         log.info(f"   💾 Guardando transcripción → {json_path}")
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump(result, f, indent=4, ensure_ascii=False)
@@ -517,24 +669,48 @@ def process_whisper_file(filename, model, progress, index, total):
         update_progress(progress, video_id, "FAILED", step="transcribe", error=e)
         return None
 
+    finally:
+        # Eliminar el archivo temporal siempre, incluso si hubo error
+        if tmp_audio and os.path.exists(tmp_audio):
+            try:
+                os.remove(tmp_audio)
+                log.info("   🗑️  Archivo temporal eliminado")
+            except OSError:
+                pass
+        if tmp_dir and os.path.isdir(tmp_dir):
+            try:
+                os.rmdir(tmp_dir)
+            except OSError:
+                pass
+
 
 def load_whisper_model():
-    log.info(f"🚀 Cargando modelo Whisper ({MODEL_SIZE})...")
+    log.info(f"🚀 Cargando modelo Whisper ({MODEL_SIZE}, beam_size={WHISPER_BEAM_SIZE}, vad={WHISPER_VAD_FILTER})...")
     from faster_whisper import WhisperModel
-    return WhisperModel(MODEL_SIZE, compute_type="int8", cpu_threads=4)
+    return WhisperModel(
+        MODEL_SIZE,
+        compute_type=WHISPER_COMPUTE_TYPE,
+        cpu_threads=WHISPER_CPU_THREADS,
+    )
 
 
-def run_transcribe(progress):
-    """Transcribe todos los archivos en source/ (modo standalone)."""
+def run_transcribe(progress, word_timestamps=False):
+    """
+    Transcribe todos los archivos en source/ (modo standalone).
+    El modelo se carga una sola vez y se libera al finalizar.
+    """
     model = load_whisper_model()
     files = sorted([f for f in os.listdir(SOURCE) if f.lower().endswith(('.wav', '.mp3'))])
     total = len(files)
     log.info(f"📂 Archivos a transcribir: {total}")
     json_paths = []
-    for i, f in enumerate(files, 1):
-        json_path = process_whisper_file(f, model, progress, i, total)
-        if json_path:
-            json_paths.append(json_path)
+    try:
+        for i, f in enumerate(files, 1):
+            json_path = process_whisper_file(f, model, progress, i, total, word_timestamps=word_timestamps)
+            if json_path:
+                json_paths.append(json_path)
+    finally:
+        _unload_model(model)
     return json_paths
 
 
@@ -581,7 +757,6 @@ def run_webhook(progress, files_override=None):
             if not json_path.endswith('.json'):
                 log.error(f"❌ No es un archivo JSON: {json_path}")
                 continue
-            # Usa el nombre del archivo como key en progress
             file_key = os.path.basename(json_path)
             update_progress(progress, file_key, "PENDING")
             send_webhook_local(json_path, file_key, progress)
@@ -607,64 +782,69 @@ def run_webhook(progress, files_override=None):
 # PIPELINE INTERCALADO
 # ==========================
 
-def run_pipeline(ids, progress, include_video=False):
+def run_pipeline(ids, progress, include_video=False, word_timestamps=False):
     """
     Pipeline intercalado por video:
       Para cada ID: descarga → transcribe → webhook → siguiente ID
 
-    La transcripción actúa como cooldown natural entre descargas de YT.
-    Al finalizar, ejecuta auto-retry para los IDs que fallaron en descarga.
+    El modelo Whisper se carga una vez y se reutiliza para todos los archivos.
+    Se libera explícitamente al finalizar el pipeline (incluyendo reintentos).
     """
     check_cookies()
     total = len(ids)
     model = load_whisper_model()
 
-    for i, video_id in enumerate(ids, 1):
-        log.info("")
-        log.info(f"{'─'*45}")
-        log.info(f"  [{i}/{total}] Procesando → {video_id}")
-        log.info(f"{'─'*45}")
+    try:
+        for i, video_id in enumerate(ids, 1):
+            log.info("")
+            log.info(f"{'─'*45}")
+            log.info(f"  [{i}/{total}] Procesando → {video_id}")
+            log.info(f"{'─'*45}")
 
-        # ── 1. DESCARGA ───────────────────────────────────────
-        if include_video:
-            log.info(f"⬇ [{i}/{total}] Video → {video_id}")
-            update_progress(progress, video_id, "IN_PROGRESS", step="download-video")
-            ok_video = download_video_for_id(video_id)
-            if ok_video:
-                log.info(f"✅ [{i}/{total}] Video OK → {video_id}")
-            else:
-                log.error(f"❌ [{i}/{total}] Video FAILED → {video_id}")
-                update_progress(progress, video_id, "FAILED", step="download-video", error="yt-dlp error")
+            # ── 1. DESCARGA ───────────────────────────────────────
+            if include_video:
+                log.info(f"⬇ [{i}/{total}] Video → {video_id}")
+                update_progress(progress, video_id, "IN_PROGRESS", step="download-video")
+                ok_video = download_video_for_id(video_id)
+                if ok_video:
+                    log.info(f"✅ [{i}/{total}] Video OK → {video_id}")
+                else:
+                    log.error(f"❌ [{i}/{total}] Video FAILED → {video_id}")
+                    update_progress(progress, video_id, "FAILED", step="download-video", error="yt-dlp error")
 
-        log.info(f"⬇ [{i}/{total}] Audio → {video_id}")
-        update_progress(progress, video_id, "IN_PROGRESS", step="download-audio")
-        ok_audio = download_audio_for_id(video_id)
+            log.info(f"⬇ [{i}/{total}] Audio → {video_id}")
+            update_progress(progress, video_id, "IN_PROGRESS", step="download-audio")
+            ok_audio = download_audio_for_id(video_id)
 
-        if not ok_audio:
-            log.error(f"❌ [{i}/{total}] Audio FAILED → {video_id} | saltando transcripción y webhook")
-            update_progress(progress, video_id, "FAILED", step="download-audio", error="yt-dlp error")
-            continue  # sigue con el siguiente ID
+            if not ok_audio:
+                log.error(f"❌ [{i}/{total}] Audio FAILED → {video_id} | saltando transcripción y webhook")
+                update_progress(progress, video_id, "FAILED", step="download-audio", error="yt-dlp error")
+                continue  # sigue con el siguiente ID
 
-        log.info(f"✅ [{i}/{total}] Audio OK → {video_id}")
+            log.info(f"✅ [{i}/{total}] Audio OK → {video_id}")
 
-        # ── 2. TRANSCRIPCIÓN ──────────────────────────────────
-        audio_file = find_downloaded_audio(video_id)
-        if not audio_file:
-            log.error(f"❌ [{i}/{total}] No se encontró el WAV en source/ → {video_id}")
-            update_progress(progress, video_id, "FAILED", step="transcribe", error="wav not found in source/")
-            continue
+            # ── 2. TRANSCRIPCIÓN ──────────────────────────────────
+            audio_file = find_downloaded_audio(video_id)
+            if not audio_file:
+                log.error(f"❌ [{i}/{total}] No se encontró el WAV en source/ → {video_id}")
+                update_progress(progress, video_id, "FAILED", step="transcribe", error="wav not found in source/")
+                continue
 
-        json_path = process_whisper_file(audio_file, model, progress, i, total)
+            json_path = process_whisper_file(audio_file, model, progress, i, total, word_timestamps=word_timestamps)
 
-        if not json_path:
-            log.error(f"❌ [{i}/{total}] Transcripción falló → {video_id} | saltando webhook")
-            continue
+            if not json_path:
+                log.error(f"❌ [{i}/{total}] Transcripción falló → {video_id} | saltando webhook")
+                continue
 
-        # ── 3. WEBHOOK ────────────────────────────────────────
-        send_webhook(json_path, progress)
+            # ── 3. WEBHOOK ────────────────────────────────────────
+            send_webhook(json_path, progress)
+
+    finally:
+        # Liberar el modelo siempre, aunque haya error en el pipeline
+        _unload_model(model)
 
     # ── AUTO-RETRY para descargas fallidas ────────────────────
-    auto_retry_downloads(ids, progress, include_video=include_video)
+    auto_retry_downloads(ids, progress, include_video=include_video, word_timestamps=word_timestamps)
 
 
 # ==========================
@@ -715,23 +895,44 @@ def load_local_files(args):
     return unique
 
 
-def process_local_file(filepath, model, progress, index, total):
+def process_local_file(filepath, model, progress, index, total, word_timestamps=False):
     """
     Transcribe un archivo de video local (mp4/mkv) directamente desde el NAS.
-    - Usa el nombre del archivo como key en progress.json
-    - Mueve el archivo original a processed/ dentro de su carpeta de origen
+
+    Flujo de memoria: igual que process_whisper_file — pre-convierte a
+    WAV 16kHz mono antes de pasar a Whisper para evitar OOM con archivos grandes.
     """
     filename  = os.path.basename(filepath)
     base_name = os.path.splitext(filename)[0]
     json_path = os.path.join(TRANSCRIPTS, f"{base_name}.json")
-    file_key  = filename  # key en progress.json es el nombre del archivo
-    video_id  = get_clean_video_id(filename)  # extrae ID del nombre igual que en modo online
+    file_key  = filename
+    video_id  = get_clean_video_id(filename)
 
     log.info(f"🎧 [{index}/{total}] Transcribiendo (local) → {filename} (ID: {video_id})")
     update_progress(progress, file_key, "IN_PROGRESS", step="transcribe")
 
+    tmp_dir   = None
+    tmp_audio = None
+
     try:
-        segments, info = model.transcribe(filepath, language="es")
+        # ── Pre-conversión a 16kHz mono ──────────────────────
+        tmp_dir   = tempfile.mkdtemp(prefix="ythelper_")
+        tmp_audio = convert_audio_for_whisper(filepath, tmp_dir)
+
+        if tmp_audio is None:
+            log.warning("   ⚠️  Usando archivo original (sin pre-conversión)")
+            audio_to_transcribe = filepath
+        else:
+            audio_to_transcribe = tmp_audio
+
+        # ── Transcripción ────────────────────────────────────
+        segments, info = model.transcribe(
+            audio_to_transcribe,
+            language="es",
+            beam_size=WHISPER_BEAM_SIZE,
+            vad_filter=WHISPER_VAD_FILTER,
+            word_timestamps=word_timestamps,
+        )
 
         result = {
             "videoId":  video_id,
@@ -746,11 +947,17 @@ def process_local_file(filepath, model, progress, index, total):
             sys.stdout.write(f"\r   ⏳ Progreso: {percent:.2f}% | {segment.end:.1f}/{info.duration:.1f} seg")
             sys.stdout.flush()
 
-            result["segments"].append({
+            seg_entry = {
                 "start": segment.start,
                 "end":   segment.end,
-                "text":  segment.text.strip()
-            })
+                "text":  segment.text.strip(),
+            }
+            if word_timestamps:
+                seg_entry["words"] = [
+                    {"word": w.word.strip(), "start": w.start, "end": w.end}
+                    for w in (segment.words or [])
+                ]
+            result["segments"].append(seg_entry)
 
         print()
         log.info(f"   💾 Guardando transcripción → {json_path}")
@@ -771,6 +978,19 @@ def process_local_file(filepath, model, progress, index, total):
         log.error(f"❌ [{index}/{total}] Transcripción FAILED → {filename} | {e}")
         update_progress(progress, file_key, "FAILED", step="transcribe", error=e)
         return None, file_key
+
+    finally:
+        if tmp_audio and os.path.exists(tmp_audio):
+            try:
+                os.remove(tmp_audio)
+                log.info("   🗑️  Archivo temporal eliminado")
+            except OSError:
+                pass
+        if tmp_dir and os.path.isdir(tmp_dir):
+            try:
+                os.rmdir(tmp_dir)
+            except OSError:
+                pass
 
 
 def send_webhook_local(json_path, file_key, progress):
@@ -796,27 +1016,32 @@ def send_webhook_local(json_path, file_key, progress):
         update_progress(progress, file_key, "FAILED", step="webhook", error=e)
 
 
-def run_local_pipeline(files, progress):
+def run_local_pipeline(files, progress, word_timestamps=False):
     """
     Pipeline para archivos locales del NAS:
       Para cada archivo: transcribe → webhook → siguiente
+
+    El modelo se carga una vez y se libera al finalizar.
     """
     total = len(files)
     model = load_whisper_model()
 
-    for i, filepath in enumerate(files, 1):
-        filename = os.path.basename(filepath)
-        log.info("")
-        log.info(f"{'─'*45}")
-        log.info(f"  [{i}/{total}] Procesando (local) → {filename}")
-        log.info(f"{'─'*45}")
+    try:
+        for i, filepath in enumerate(files, 1):
+            filename = os.path.basename(filepath)
+            log.info("")
+            log.info(f"{'─'*45}")
+            log.info(f"  [{i}/{total}] Procesando (local) → {filename}")
+            log.info(f"{'─'*45}")
 
-        json_path, file_key = process_local_file(filepath, model, progress, i, total)
+            json_path, file_key = process_local_file(filepath, model, progress, i, total, word_timestamps=word_timestamps)
 
-        if json_path:
-            send_webhook_local(json_path, file_key, progress)
-        else:
-            log.error(f"❌ [{i}/{total}] Saltando webhook → {filename}")
+            if json_path:
+                send_webhook_local(json_path, file_key, progress)
+            else:
+                log.error(f"❌ [{i}/{total}] Saltando webhook → {filename}")
+    finally:
+        _unload_model(model)
 
 
 # ==========================
@@ -838,14 +1063,20 @@ modos:
   run-full         Pipeline intercalado: audio+video → transcribe → webhook
   local            Pipeline desde NAS: transcribe → webhook (sin descarga)
 
+webhooks disponibles (--webhook):
+  predicas         WEBHOOK_URL_PREDICAS        (producción prédicas)
+  predicas-test    WEBHOOK_URL_PREDICAS_TEST   (pruebas prédicas)
+  gc               WEBHOOK_URL_GC              (producción GC)
+  gc-test          WEBHOOK_URL_GC_TEST         (pruebas GC)
+
 ejemplos:
-  python ythelper.py --mode run-full  --ids abc123 def456
-  python ythelper.py --mode run-audio --ids-file ids.txt
-  python ythelper.py --mode run-full  --resume
-  python ythelper.py --mode transcribe
-  python ythelper.py --mode webhook
-  python ythelper.py --mode local --file /mnt/nas/sermones/video.mp4
-  python ythelper.py --mode local --local-folder /mnt/nas/sermones/
+  python ythelper.py --mode run-full  --ids abc123 def456 --webhook predicas
+  python ythelper.py --mode run-audio --ids-file ids.txt  --webhook predicas
+  python ythelper.py --mode run-full  --resume            --webhook gc
+  python ythelper.py --mode transcribe --word-timestamps
+  python ythelper.py --mode webhook   --webhook predicas-test
+  python ythelper.py --mode webhook   --webhook predicas --file transcript.json
+  python ythelper.py --mode local     --local-folder /mnt/nas/sermones/ --webhook gc-test
         """
     )
     parser.add_argument(
@@ -881,9 +1112,16 @@ ejemplos:
         help="Retomar desde progress.json, salteando los IDs ya DONE"
     )
     parser.add_argument(
-        "--test",
+        "--webhook",
+        choices=["predicas", "predicas-test", "gc", "gc-test"],
+        default=None,
+        help="Webhook destino: predicas | predicas-test | gc | gc-test"
+    )
+    parser.add_argument(
+        "--word-timestamps",
         action="store_true",
-        help="Usar WEBHOOK_URL_TEST del .env en lugar de WEBHOOK_URL (ambiente de pruebas)"
+        dest="word_timestamps",
+        help="Incluir timestamps por palabra en el transcript (útil para subtítulos dinámicos)"
     )
     args = parser.parse_args()
 
@@ -893,22 +1131,22 @@ ejemplos:
 
     setup_logging()
 
-    # Resolver URL de webhook según --test
+    # Resolver URL de webhook según --webhook
     global ACTIVE_WEBHOOK_URL
-    if args.test:
-        if not WEBHOOK_URL_TEST:
-            log.error("❌ --test activo pero WEBHOOK_URL_TEST no está definida en el .env")
+    needs_webhook = args.mode in ("webhook", "run-audio", "run-full", "local")
+    if needs_webhook:
+        if not args.webhook:
+            parser.error(f"--mode {args.mode} requiere --webhook (predicas | predicas-test | gc | gc-test)")
+        url = WEBHOOK_URLS.get(args.webhook)
+        if not url:
+            log.error(f"❌ La variable de entorno para '{args.webhook}' no está definida en el .env")
             sys.exit(1)
-        ACTIVE_WEBHOOK_URL = WEBHOOK_URL_TEST
-        log.info(f"🧪 Modo TEST activo → {ACTIVE_WEBHOOK_URL}")
-    else:
-        if not WEBHOOK_URL:
-            log.error("❌ WEBHOOK_URL no está definida en el .env")
-            sys.exit(1)
-        ACTIVE_WEBHOOK_URL = WEBHOOK_URL
+        ACTIVE_WEBHOOK_URL = url
+        marker = "🧪 TEST" if "test" in args.webhook else "🚀 PROD"
+        log.info(f"{marker} Webhook [{args.webhook}] → {ACTIVE_WEBHOOK_URL}")
 
     log.info(f"{'='*45}")
-    log.info(f"  ythelper | modo: {args.mode} | test: {args.test} | resume: {args.resume}")
+    log.info(f"  ythelper | modo: {args.mode} | webhook: {args.webhook} | words: {args.word_timestamps} | resume: {args.resume}")
     log.info(f"{'='*45}")
 
     # Validación: local requiere --file o --local-folder
@@ -943,7 +1181,7 @@ ejemplos:
 
     # ── TRANSCRIBE ────────────────────────────────────────────
     elif args.mode == "transcribe":
-        run_transcribe(progress)
+        run_transcribe(progress, word_timestamps=args.word_timestamps)
 
     # ── WEBHOOK ───────────────────────────────────────────────
     elif args.mode == "webhook":
@@ -954,11 +1192,11 @@ ejemplos:
 
     # ── RUN-AUDIO ─────────────────────────────────────────────
     elif args.mode == "run-audio":
-        run_pipeline(ids, progress, include_video=False)
+        run_pipeline(ids, progress, include_video=False, word_timestamps=args.word_timestamps)
 
     # ── RUN-FULL ──────────────────────────────────────────────
     elif args.mode == "run-full":
-        run_pipeline(ids, progress, include_video=True)
+        run_pipeline(ids, progress, include_video=True, word_timestamps=args.word_timestamps)
 
     # ── LOCAL ─────────────────────────────────────────────────
     elif args.mode == "local":
@@ -967,7 +1205,7 @@ ejemplos:
         for f in files:
             if os.path.basename(f) not in progress:
                 update_progress(progress, os.path.basename(f), "PENDING")
-        run_local_pipeline(files, progress)
+        run_local_pipeline(files, progress, word_timestamps=args.word_timestamps)
 
     print_summary(progress)
     log.info("✨ ¡Todo terminado!")
